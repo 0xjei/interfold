@@ -420,3 +420,263 @@ async fn a_malformed_notification_is_not_fetched() -> Result<()> {
     assert_eq!(publisher.send(FetchBacklog).await?, (0, 0));
     Ok(())
 }
+
+/// A forged notification that reaches the node first must not cost it the document: the correct
+/// notification that arrives during the forged fetch is checked against the fetched bytes, without
+/// fetching the document again.
+#[actix::test]
+async fn a_forged_notification_does_not_block_the_correct_one() -> Result<()> {
+    let (_guard, bus, _net_cmd_tx, mut commands, net_events, _, history, _, publisher) =
+        setup_test()?;
+    let e3_id = E3id::new("forged", 1);
+    let value = EventConversionService::encryption_key_to_request(EncryptionKeyCreated {
+        e3_id: e3_id.clone(),
+        key: Arc::new(EncryptionKey::new(1, ArcBytes::from_bytes(b"public key"))),
+        external: false,
+    })?
+    .expect("local key should produce a document")
+    .value;
+    let key = ContentHash::from_content(&value);
+    bus.publish_without_context(CiphernodeSelected {
+        e3_id: e3_id.clone(),
+        threshold_m: 2,
+        threshold_n: 3,
+        ..CiphernodeSelected::default()
+    })?;
+    publisher.send(PublisherBarrier).await?;
+    let expires_at = Some(Utc::now() + chrono::Duration::hours(1));
+    // A broadcast key document carries no party filter. A filter that names this node's party
+    // (0) passes the relevance check, but not the payload check.
+    let forged = DocumentPublishedNotification {
+        key: key.clone(),
+        meta: DocumentMeta::new(
+            e3_id.clone(),
+            DocumentKind::TrBFV,
+            vec![e3_events::Filter::Item(0)],
+            expires_at,
+        ),
+        ts: 100,
+    };
+    let genuine = DocumentPublishedNotification {
+        key: key.clone(),
+        meta: DocumentMeta::new(e3_id.clone(), DocumentKind::TrBFV, vec![], expires_at),
+        ts: 101,
+    };
+
+    publisher.send(forged).await?;
+    let Some(NetCommand::DhtGetRecord { correlation_id, .. }) =
+        timeout(Duration::from_secs(1), commands.recv()).await?
+    else {
+        bail!("expected a fetch for the forged notification");
+    };
+    publisher.send(genuine).await?;
+    net_events.send(NetEvent::DhtGetRecordSucceeded {
+        key: key.clone(),
+        correlation_id,
+        value: value.clone(),
+    })?;
+    sleep(Duration::from_millis(200)).await;
+
+    assert!(
+        timeout(Duration::from_millis(200), commands.recv())
+            .await
+            .is_err(),
+        "the document must not be fetched again for the correct notification"
+    );
+    let events = history.send(GetEvents::new()).await?;
+    let received = events.iter().find_map(|event| match event.get_data() {
+        InterfoldEventData::DocumentReceived(document) => Some(document.clone()),
+        _ => None,
+    });
+    let received = received.expect("the correct notification delivers the document");
+    assert!(received.meta.filter.is_empty());
+    assert_eq!(received.value.extract_bytes(), value.extract_bytes());
+    Ok(())
+}
+
+/// A peer can answer a fetch with another valid document. The node must not accept a document
+/// for a key that it did not ask for.
+#[actix::test]
+async fn a_document_for_another_key_is_not_accepted() -> Result<()> {
+    let (_guard, bus, _net_cmd_tx, mut commands, net_events, _, history, _, publisher) =
+        setup_test()?;
+    let e3_id = E3id::new("substituted", 1);
+    let document = |label: &'static [u8]| {
+        EventConversionService::encryption_key_to_request(EncryptionKeyCreated {
+            e3_id: e3_id.clone(),
+            key: Arc::new(EncryptionKey::new(1, ArcBytes::from_bytes(label))),
+            external: false,
+        })
+        .map(|request| request.expect("local key should produce a document").value)
+    };
+    let requested = document(b"requested key")?;
+    let other = document(b"other key")?;
+    bus.publish_without_context(CiphernodeSelected {
+        e3_id: e3_id.clone(),
+        threshold_m: 2,
+        threshold_n: 3,
+        ..CiphernodeSelected::default()
+    })?;
+    publisher.send(PublisherBarrier).await?;
+    publisher
+        .send(DocumentPublishedNotification {
+            key: ContentHash::from_content(&requested),
+            meta: DocumentMeta::new(
+                e3_id,
+                DocumentKind::TrBFV,
+                vec![],
+                Some(Utc::now() + chrono::Duration::hours(1)),
+            ),
+            ts: 100,
+        })
+        .await?;
+    let Some(NetCommand::DhtGetRecord { correlation_id, .. }) =
+        timeout(Duration::from_secs(1), commands.recv()).await?
+    else {
+        bail!("expected a fetch");
+    };
+
+    net_events.send(NetEvent::DhtGetRecordSucceeded {
+        key: ContentHash::from_content(&other),
+        correlation_id,
+        value: other,
+    })?;
+
+    let Some(NetCommand::DhtGetRecord { key, .. }) =
+        timeout(Duration::from_secs(5), commands.recv()).await?
+    else {
+        bail!("expected the fetch to be retried");
+    };
+    assert_eq!(key, ContentHash::from_content(&requested));
+    let events = history.send(GetEvents::new()).await?;
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event.get_data(), InterfoldEventData::DocumentReceived(_))),
+        "a document for another key must not be accepted"
+    );
+    Ok(())
+}
+
+/// A forged notification that arrives before this node knows it is on the committee must not hide
+/// the correct one: both are buffered, and the fetch accepts the document under the correct one.
+#[actix::test]
+async fn a_forged_notification_before_selection_does_not_hide_the_correct_one() -> Result<()> {
+    let (_guard, bus, _net_cmd_tx, mut commands, net_events, _, history, _, publisher) =
+        setup_test()?;
+    let e3_id = E3id::new("early-forged", 1);
+    let value = EventConversionService::encryption_key_to_request(EncryptionKeyCreated {
+        e3_id: e3_id.clone(),
+        key: Arc::new(EncryptionKey::new(1, ArcBytes::from_bytes(b"public key"))),
+        external: false,
+    })?
+    .expect("local key should produce a document")
+    .value;
+    let key = ContentHash::from_content(&value);
+    let expires_at = Some(Utc::now() + chrono::Duration::hours(1));
+    let notification = |filter| DocumentPublishedNotification {
+        key: key.clone(),
+        meta: DocumentMeta::new(e3_id.clone(), DocumentKind::TrBFV, filter, expires_at),
+        ts: 100,
+    };
+    publisher
+        .send(notification(vec![e3_events::Filter::Item(0)]))
+        .await?;
+    publisher.send(notification(vec![])).await?;
+
+    bus.publish_without_context(CiphernodeSelected {
+        e3_id: e3_id.clone(),
+        threshold_m: 2,
+        threshold_n: 3,
+        ..CiphernodeSelected::default()
+    })?;
+    let Some(NetCommand::DhtGetRecord { correlation_id, .. }) =
+        timeout(Duration::from_secs(1), commands.recv()).await?
+    else {
+        bail!("expected a fetch after selection");
+    };
+    net_events.send(NetEvent::DhtGetRecordSucceeded {
+        key,
+        correlation_id,
+        value: value.clone(),
+    })?;
+    sleep(Duration::from_millis(200)).await;
+
+    let events = history.send(GetEvents::new()).await?;
+    let received = events.iter().find_map(|event| match event.get_data() {
+        InterfoldEventData::DocumentReceived(document) => Some(document.clone()),
+        _ => None,
+    });
+    let received = received.expect("the buffered correct notification delivers the document");
+    assert!(received.meta.filter.is_empty());
+    Ok(())
+}
+
+/// Before selection, a forged notification with the correct filter must not hide the correct one
+/// by expiring first: the buffer keeps the notification with the latest expiry per filter, and
+/// selection does not deliver notifications that expired while the node waited.
+#[actix::test]
+async fn an_early_forged_notification_that_expires_first_does_not_hide_the_correct_one(
+) -> Result<()> {
+    let (_guard, bus, _net_cmd_tx, mut commands, net_events, _, history, _, publisher) =
+        setup_test()?;
+    let e3_id = E3id::new("early-expiring", 1);
+    let value = EventConversionService::encryption_key_to_request(EncryptionKeyCreated {
+        e3_id: e3_id.clone(),
+        key: Arc::new(EncryptionKey::new(1, ArcBytes::from_bytes(b"public key"))),
+        external: false,
+    })?
+    .expect("local key should produce a document")
+    .value;
+    let key = ContentHash::from_content(&value);
+    let notification = |filter, lifetime| DocumentPublishedNotification {
+        key: key.clone(),
+        meta: DocumentMeta::new(
+            e3_id.clone(),
+            DocumentKind::TrBFV,
+            filter,
+            Some(Utc::now() + lifetime),
+        ),
+        ts: 100,
+    };
+    publisher
+        .send(notification(
+            vec![e3_events::Filter::Item(0)],
+            chrono::Duration::hours(1),
+        ))
+        .await?;
+    publisher
+        .send(notification(vec![], chrono::Duration::milliseconds(300)))
+        .await?;
+    publisher
+        .send(notification(vec![], chrono::Duration::hours(1)))
+        .await?;
+    sleep(Duration::from_millis(500)).await;
+
+    bus.publish_without_context(CiphernodeSelected {
+        e3_id: e3_id.clone(),
+        threshold_m: 2,
+        threshold_n: 3,
+        ..CiphernodeSelected::default()
+    })?;
+    let Some(NetCommand::DhtGetRecord { correlation_id, .. }) =
+        timeout(Duration::from_secs(1), commands.recv()).await?
+    else {
+        bail!("expected a fetch after selection");
+    };
+    net_events.send(NetEvent::DhtGetRecordSucceeded {
+        key,
+        correlation_id,
+        value: value.clone(),
+    })?;
+    sleep(Duration::from_millis(200)).await;
+
+    let events = history.send(GetEvents::new()).await?;
+    let received = events.iter().find_map(|event| match event.get_data() {
+        InterfoldEventData::DocumentReceived(document) => Some(document.clone()),
+        _ => None,
+    });
+    let received = received.expect("the correct notification delivers the document");
+    assert!(received.meta.filter.is_empty());
+    Ok(())
+}

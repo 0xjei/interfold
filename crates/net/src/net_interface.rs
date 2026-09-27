@@ -84,6 +84,9 @@ const MAX_CONSECUTIVE_DIAL_FAILURES: u32 = 3;
 const STALE_PEER_COOLDOWN: Duration = Duration::from_secs(30 * 60);
 const CONFIGURED_PEER_REDIAL_INTERVAL: Duration = Duration::from_secs(15);
 const GOSSIP_HEALTH_INTERVAL: Duration = Duration::from_secs(5);
+/// How often expired DHT records are removed. Kademlia's own record jobs, which also removed them,
+/// are disabled, and `MemoryStore` counts an expired record against its limits until it is removed.
+const DHT_EXPIRY_INTERVAL: Duration = Duration::from_secs(60);
 const GOSSIP_SUBSCRIPTION_GRACE: Duration = Duration::from_secs(30);
 pub(crate) const EVENT_CHANNEL_SIZE: usize = 1000;
 const CMD_CHANNEL_SIZE: usize = 1000;
@@ -415,6 +418,9 @@ impl Libp2pNetInterface {
         let mut gossip_health_tick = tokio::time::interval(GOSSIP_HEALTH_INTERVAL);
         gossip_health_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         gossip_health_tick.tick().await;
+        let mut dht_expiry_tick = tokio::time::interval(DHT_EXPIRY_INTERVAL);
+        dht_expiry_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        dht_expiry_tick.tick().await;
         let mut gossip_health = GossipSubscriptionHealth::default();
         let mut configured_peers: Vec<_> = self
             .peers
@@ -494,6 +500,10 @@ impl Libp2pNetInterface {
                             });
                         }
                     }
+                }
+                _ = dht_expiry_tick.tick() => {
+                    prune_expired_dht_records(&mut self.swarm);
+                    prune_dht_peer_quotas(&mut self.swarm, &mut dht_records_by_peer);
                 }
                 _ = configured_peer_tick.tick() => {
                     redial_disconnected_configured_peers(
@@ -723,9 +733,10 @@ fn create_behaviour(
     // remote peers, which then dial themselves. Kademlia still adds a dialed address to an existing
     // entry; `RoutingUpdated` removes loopback addresses again.
     //
-    // The library's record jobs are off. The replication job would put every stored record, which
-    // includes every peer's DKG documents, to 20 peers each hour, and the publication job would
-    // republish this node's records. The document publisher refreshes its own documents instead.
+    // The library's record jobs are off. Each hour the replication job would put every stored record
+    // that no peer put again since its last run to up to 20 peers; after a DKG ends, that includes
+    // the other peers' DKG documents. The publication job would republish this node's records. The
+    // document publisher refreshes its own documents instead.
     config
         .set_max_packet_size(MAX_KADEMLIA_PAYLOAD_BYTES)
         .set_query_timeout(DHT_QUERY_TIMEOUT)
@@ -1036,6 +1047,19 @@ async fn process_swarm_event(
             },
         )) => match result {
             Ok(GetRecordOk::FoundRecord(record)) => {
+                // Kademlia passes on whatever record a peer returns. A peer can answer with a
+                // different, self-consistent document, so only the requested key is accepted, and
+                // the query keeps running for the other peers' answers.
+                let requested = swarm.behaviour().kademlia.query(&id).is_some_and(|query| {
+                    matches!(
+                        query.info(),
+                        kad::QueryInfo::GetRecord { key, .. } if *key == record.record.key
+                    )
+                });
+                if !requested {
+                    debug!(peer = ?record.peer, "Ignored a DHT record for a key that was not requested");
+                    return Ok(());
+                }
                 let key = ContentHash(record.record.key.to_vec());
                 let record_bytes = record.record.value;
                 let check_key = ContentHash::from_content(&record_bytes);
@@ -1623,8 +1647,8 @@ fn handle_remove_records(swarm: &mut Swarm<NodeBehaviour>, keys: Vec<ContentHash
 /// all records, expired or not.  This helper removes stale entries so that
 /// the `max_records` budget reflects only live data.
 ///
-/// This is a fallback safety net — primary cleanup happens per-E3 via
-/// `handle_remove_records` when an E3 completes.
+/// It runs every [`DHT_EXPIRY_INTERVAL`] and when a local put hits the record limit. Records of a
+/// completed E3 are also removed by `handle_remove_records`.
 fn prune_expired_dht_records(swarm: &mut Swarm<NodeBehaviour>) {
     let now = Instant::now();
     let store = swarm.behaviour_mut().kademlia.store_mut();

@@ -6,13 +6,23 @@ use super::*;
 use crate::domain::EventConversionService;
 use crate::net_interface_handle::NetEventSubscriber;
 
-/// A fetched document does not match the metadata of the notification that named it.
+/// A fetched document does not match the metadata of the notifications that named it. It keeps
+/// the fetched bytes, so notifications that arrive later can be checked without fetching again.
 #[derive(Debug)]
-pub(super) struct DocumentMetadataMismatch(anyhow::Error);
+pub(super) struct DocumentMetadataMismatch {
+    error: anyhow::Error,
+    value: ArcBytes,
+}
+
+impl DocumentMetadataMismatch {
+    pub(super) fn value(&self) -> &ArcBytes {
+        &self.value
+    }
+}
 
 impl std::fmt::Display for DocumentMetadataMismatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:#}", self.0)
+        write!(f, "{:#}", self.error)
     }
 }
 
@@ -67,42 +77,77 @@ pub(super) async fn announce_document(
     broadcast_document_published_notification(tx, rx, notification, topic).await
 }
 
-/// Called when we receive a notification from the net_interface
+/// Fetch a notified document and bind it to the notification whose metadata matches it.
+///
+/// `notifications` name the same document (one content hash) and can carry different metadata,
+/// because peers choose the metadata. The document is fetched once and accepted under the first
+/// relevant notification whose metadata matches the payload. The returned notification supplies
+/// the timestamp of the received event.
 pub async fn handle_document_published_notification(
     net_cmds: mpsc::Sender<NetCommand>,
     net_events: NetEventSubscriber,
     ids: HashMap<E3id, PartyId>,
-    event: DocumentPublishedNotification,
-) -> Result<Option<DocumentReceived>> {
-    let Some(party_id) = DocumentPublishingService::interest_in(&ids, &event) else {
-        debug!("Node not interested in id {}", event.meta.e3_id);
+    notifications: Vec<DocumentPublishedNotification>,
+) -> Result<Option<(DocumentReceived, DocumentPublishedNotification)>> {
+    let relevant: Vec<_> = notifications
+        .into_iter()
+        .filter(|notification| DocumentPublishingService::interest_in(&ids, notification).is_some())
+        .collect();
+    let Some(first) = relevant.first() else {
+        debug!("Node not interested in the notified document");
         return Ok(None);
     };
-
+    let key = first.key.clone();
     debug!(
-        "interested in document {:?} with party_id={:?}",
-        event, party_id
+        "interested in document {:?} with {} candidate notification(s)",
+        key,
+        relevant.len()
     );
 
     let value = retry_with_backoff(
-        || get_record(net_cmds.clone(), net_events.clone(), event.key.clone()).map_err(to_retry),
+        || get_record(net_cmds.clone(), net_events.clone(), key.clone()).map_err(to_retry),
         4,
         1000,
     )
     .await?;
 
-    // The gossiped metadata is not covered by the DHT content hash. Bind it to the decoded
-    // payload before persisting DocumentReceived; otherwise a notification for an E3 this node is
-    // interested in can inject a content-addressed document for a different E3 or party route.
-    // A mismatch is final for this metadata, so the caller does not retry it; a correct
-    // notification for the same document is fetched on its own.
-    EventConversionService::validate_received(&event.meta, &value)
-        .map_err(|error| anyhow::Error::new(DocumentMetadataMismatch(error)))?;
+    // When no candidate matches, the mismatch is final for these notifications, so the caller does
+    // not fetch the document again for them. It checks later notifications against these bytes.
+    bind_to_candidate(&ids, relevant, value.clone())
+        .map_err(|error| anyhow::Error::new(DocumentMetadataMismatch { error, value }))
+}
 
-    Ok(Some(DocumentReceived {
-        meta: event.meta,
-        value,
-    }))
+/// Accept `value` under the first relevant candidate whose metadata matches its payload.
+///
+/// The gossiped metadata is not covered by the DHT content hash. Binding it to the decoded payload
+/// before persisting DocumentReceived stops a notification for an E3 this node is interested in
+/// from injecting a content-addressed document for a different E3 or party route. Returns
+/// `Ok(None)` when no candidate is relevant to this node, and the last mismatch otherwise.
+pub(super) fn bind_to_candidate(
+    ids: &HashMap<E3id, PartyId>,
+    candidates: Vec<DocumentPublishedNotification>,
+    value: ArcBytes,
+) -> Result<Option<(DocumentReceived, DocumentPublishedNotification)>> {
+    let mut mismatch = None;
+    for notification in candidates {
+        if DocumentPublishingService::interest_in(ids, &notification).is_none() {
+            continue;
+        }
+        match EventConversionService::validate_received(&notification.meta, &value) {
+            Ok(()) => {
+                let document = DocumentReceived {
+                    meta: notification.meta.clone(),
+                    value,
+                };
+                return Ok(Some((document, notification)));
+            }
+            Err(error) => mismatch = Some(error),
+        }
+    }
+    match mismatch {
+        Some(error) => Err(error),
+        None => Ok(None),
+    }
 }
 
 /// Call DhtPutRecord Command on the Libp2pNetInterface and handle the results
@@ -147,10 +192,15 @@ async fn get_record(
         net_events,
         NetCommand::DhtGetRecord {
             correlation_id: id,
-            key,
+            key: key.clone(),
         },
         |event| match event {
-            NetEvent::DhtGetRecordSucceeded { value, .. } => Some(Ok(value.clone())),
+            NetEvent::DhtGetRecordSucceeded {
+                key: found, value, ..
+            } if found == &key => Some(Ok(value.clone())),
+            NetEvent::DhtGetRecordSucceeded { .. } => Some(Err(anyhow::anyhow!(
+                "DHT get record returned a document for another key"
+            ))),
             NetEvent::DhtGetRecordError { error, .. } => {
                 Some(Err(anyhow::anyhow!("DHT get record failed: {:?}", error)))
             }

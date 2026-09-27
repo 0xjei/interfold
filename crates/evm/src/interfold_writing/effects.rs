@@ -244,9 +244,17 @@ pub(in crate::actors::interfold_sol_writer) async fn should_publish_plaintext<
 ) -> Result<bool> {
     let e3_id: U256 = e3_id.try_into()?;
     let contract = IInterfold::new(contract_address, provider.provider());
+    // Only an E3 that waits for its plaintext accepts one. Any node that computed a result
+    // submits it, so a completed or failed E3 must end the retries instead of reverting forever.
+    if contract.getE3Stage(e3_id).call().await? != CIPHERTEXT_READY_STAGE {
+        return Ok(false);
+    }
     let e3 = contract.getE3(e3_id).call().await?;
     Ok(e3.plaintextOutput.is_empty())
 }
+
+/// `E3Stage.CiphertextReady` in the Interfold contract.
+const CIPHERTEXT_READY_STAGE: u8 = 4;
 
 pub(in crate::actors::interfold_sol_writer) async fn process_e3_failure<
     P: Provider + WalletProvider + Clone,
@@ -269,11 +277,10 @@ pub(in crate::actors::interfold_sol_writer) async fn process_e3_failure<
 
     // Simulate first, so that a settlement that is not open yet does not hold the nonce guard.
     if let Err(error) = contract.processE3Failure(e3_id).call().await {
-        let error = anyhow::Error::from(error);
         if failure_settlement_is_blocked(&error) {
             return Ok(FailureSettlementOutcome::Blocked);
         }
-        return Err(error);
+        return Err(error.into());
     }
 
     let _nonce_guard = transaction_nonce_guard(&provider).await;
@@ -294,18 +301,29 @@ pub(in crate::actors::interfold_sol_writer) async fn process_e3_failure<
 pub(in crate::actors::interfold_sol_writer) fn failure_settlement_error_is_terminal(
     error: &anyhow::Error,
 ) -> bool {
-    contains_error_selector(
-        &format!("{error:?}"),
-        IInterfold::NoPaymentToRefund::SELECTOR,
-    )
+    reverted_with::<IInterfold::NoPaymentToRefund>(error)
 }
 
 /// Return true when the refund manager does not accept settlement for this E3 yet.
-fn failure_settlement_is_blocked(error: &anyhow::Error) -> bool {
-    contains_error_selector(
-        &format!("{error:?}"),
-        IInterfold::SettlementBlocked::SELECTOR,
-    )
+///
+/// Only decoded revert data counts. Error text from an RPC or transport failure can contain the
+/// selector bytes, and that text must not defer settlement.
+fn failure_settlement_is_blocked(error: &alloy::contract::Error) -> bool {
+    error
+        .as_decoded_error::<IInterfold::SettlementBlocked>()
+        .is_some()
+}
+
+/// Whether `error` is a contract call that reverted with the custom error `E`.
+///
+/// Only the structured revert data of the call counts. A selector that merely appears in an
+/// error message, for example in an RPC quota error, does not.
+fn reverted_with<E: SolError>(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<alloy::contract::Error>()
+            .is_some_and(|error| error.as_decoded_error::<E>().is_some())
+    })
 }
 
 #[cfg(test)]
@@ -320,14 +338,19 @@ mod tests {
     use e3_events::E3Stage;
 
     /// Build the error that `eth_call` returns for a contract revert with this revert data.
-    fn eth_call_revert(selector: [u8; 4], words: usize) -> anyhow::Error {
+    fn eth_call_revert(selector: [u8; 4], words: usize) -> alloy::contract::Error {
         let response = format!(
             r#"{{"code":3,"message":"execution reverted","data":"0x{}{}"}}"#,
             hex::encode(selector),
             "00".repeat(32 * words)
         );
-        let error = TransportError::ErrorResp(serde_json::from_str(&response).unwrap());
-        alloy::contract::Error::TransportError(error).into()
+        rpc_error(&response)
+    }
+
+    /// Build the contract error for this JSON-RPC error response.
+    fn rpc_error(response: &str) -> alloy::contract::Error {
+        let error = TransportError::ErrorResp(serde_json::from_str(response).unwrap());
+        alloy::contract::Error::TransportError(error)
     }
 
     #[test]
@@ -361,34 +384,57 @@ mod tests {
 
     #[test]
     fn settled_failure_stops_retries() {
-        let error = anyhow::anyhow!(
-            "execution reverted: 0x{}{}",
-            hex::encode(IInterfold::NoPaymentToRefund::SELECTOR),
-            "00".repeat(32)
-        );
+        let error: anyhow::Error =
+            eth_call_revert(IInterfold::NoPaymentToRefund::SELECTOR, 1).into();
         assert!(failure_settlement_error_is_terminal(&error));
+        assert!(failure_settlement_error_is_terminal(
+            &error.context("process E3 failure")
+        ));
         assert!(!failure_settlement_error_is_terminal(&anyhow::anyhow!(
             "RPC connection reset"
         )));
+    }
+
+    /// A `NoPaymentToRefund` selector in the text of an error that is not a revert must not stop
+    /// the retries.
+    #[test]
+    fn a_selector_in_an_error_message_is_not_a_revert() {
+        let message = anyhow::anyhow!(
+            "RPC rate limited; request tag 0x{}{}",
+            hex::encode(IInterfold::NoPaymentToRefund::SELECTOR),
+            "00".repeat(32)
+        );
+        assert!(!failure_settlement_error_is_terminal(&message));
     }
 
     #[test]
     fn settlement_simulation_separates_blocked_settled_and_other_reverts() {
         let blocked = eth_call_revert(IInterfold::SettlementBlocked::SELECTOR, 0);
         assert!(failure_settlement_is_blocked(&blocked));
-        assert!(!failure_settlement_error_is_terminal(&blocked));
+        assert!(!failure_settlement_error_is_terminal(&blocked.into()));
 
         let settled = eth_call_revert(IInterfold::NoPaymentToRefund::SELECTOR, 1);
-        assert!(failure_settlement_error_is_terminal(&settled));
         assert!(!failure_settlement_is_blocked(&settled));
+        assert!(failure_settlement_error_is_terminal(&settled.into()));
 
         let other = eth_call_revert(IInterfold::E3NotFailed::SELECTOR, 1);
         assert!(!failure_settlement_is_blocked(&other));
-        assert!(!failure_settlement_error_is_terminal(&other));
+        assert!(!failure_settlement_error_is_terminal(&other.into()));
 
-        let transport = anyhow::anyhow!("RPC connection reset");
-        assert!(!failure_settlement_is_blocked(&transport));
-        assert!(!failure_settlement_error_is_terminal(&transport));
+        assert!(!failure_settlement_error_is_terminal(&anyhow::anyhow!(
+            "RPC connection reset"
+        )));
+    }
+
+    #[test]
+    fn selector_text_outside_revert_data_does_not_block_settlement() {
+        // The selector is only in the message of an error that is not a revert.
+        let message = rpc_error(r#"{"code":-32000,"message":"upstream failure 0xf51125bb"}"#);
+        assert!(!failure_settlement_is_blocked(&message));
+
+        // The data field has the selector, but the node does not report a revert.
+        let data = rpc_error(r#"{"code":-32005,"message":"rate limited","data":"0xf51125bb"}"#);
+        assert!(!failure_settlement_is_blocked(&data));
     }
 
     #[test]
