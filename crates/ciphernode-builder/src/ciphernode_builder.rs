@@ -58,7 +58,10 @@ use e3_sortition::{
     NodeStateRepositoryFactory, Sortition, SortitionAttachParams, SortitionBackend,
     SortitionRecoveryRepositoryFactory, SortitionRepositoryFactory,
 };
-use e3_sync::{preflight_schema_version, reconcile_request_router_checkpoint, sync_with_net_ready};
+use e3_sync::{
+    preflight_node_role, preflight_schema_version, reconcile_request_router_checkpoint,
+    sync_with_net_ready, NodeRole,
+};
 use e3_utils::SharedRng;
 use e3_zk_prover::{setup_zk_actors, ZkActorRecovery, ZkBackend};
 use libp2p::PeerId;
@@ -116,6 +119,7 @@ pub struct CiphernodeBuilder {
     proof_aggregation_enabled: bool,
     pubkey_agg: bool,
     rng: SharedRng,
+    role: NodeRole,
     sortition_backend: SortitionBackend,
     source_bus: Option<BusMode<Addr<EventBus<InterfoldEvent>>>>,
     task_pool: Option<TaskPool>,
@@ -194,6 +198,7 @@ impl CiphernodeBuilder {
             proof_aggregation_enabled: true,
             pubkey_agg: false,
             rng,
+            role: NodeRole::Full,
             sortition_backend: SortitionBackend::score(),
             source_bus: None,
             task_pool: None,
@@ -227,6 +232,14 @@ impl CiphernodeBuilder {
     /// Set the node name for dashboard display and log attribution.
     pub fn with_name(mut self, name: &str) -> Self {
         self.name = Some(name.to_string());
+        self
+    }
+
+    /// Build a bootstrap node. It installs no accusation or commitment-check extensions, so it
+    /// signs no protocol messages. It starts without peer history when no peer can serve it. Its
+    /// data directory is stamped as a bootstrap node's, and a full node refuses to start on it.
+    pub fn with_bootstrap_role(mut self) -> Self {
+        self.role = NodeRole::Bootstrap;
         self
     }
 
@@ -617,6 +630,7 @@ impl CiphernodeBuilder {
     }
 
     pub async fn build(mut self) -> anyhow::Result<CiphernodeHandle> {
+        self.ensure_role_components()?;
         ensure!(
             self.multithread_concurrent_jobs != Some(0),
             "the detected memory limit cannot safely run one prover job in addition to the node; increase the host or cgroup memory limit"
@@ -675,8 +689,10 @@ impl CiphernodeBuilder {
         // Establish storage compatibility before signers, actors, or forked runtime events can
         // create durable state. Running this only inside `sync` is too late: actor startup can
         // make a fresh store non-empty and cause it to look like unversioned legacy data.
-        preflight_schema_version(&repositories, &eventstore_aggregate_config, &seq_eventstore)
-            .await?;
+        let new_directory =
+            preflight_schema_version(&repositories, &eventstore_aggregate_config, &seq_eventstore)
+                .await?;
+        preflight_node_role(&repositories, new_directory, self.role).await?;
         ensure_request_router_checkpoint(&repositories, aggregate_config.aggregates()).await?;
         reconcile_request_router_checkpoint(
             &repositories,
@@ -830,6 +846,9 @@ impl CiphernodeBuilder {
             self.max_buffered_net_bytes,
             selected_party_ids,
             recovered_documents,
+            // A bootstrap node uses no E3 history, so it starts without it when no peer can serve
+            // it. A lone seed would otherwise wait for its startup deadline while an E3 is open.
+            self.role == NodeRole::Bootstrap,
         )?;
 
         // Attach the request router after network startup is registered. Recovered local
@@ -884,6 +903,27 @@ impl CiphernodeBuilder {
     }
 
     // ── build() sub-functions ──────────────────────────────────────────
+
+    /// A bootstrap node must not run anything that joins a committee, signs, or sends a
+    /// transaction. It reads only the Interfold contract.
+    fn ensure_role_components(&self) -> Result<()> {
+        if self.role == NodeRole::Full {
+            return Ok(());
+        }
+        let components = &self.contract_components;
+        ensure!(
+            self.keyshare.is_none()
+                && !self.pubkey_agg
+                && !self.threshold_plaintext_agg
+                && !components.interfold
+                && !components.ciphernode_registry
+                && !components.bonding_registry
+                && !components.slashing_manager,
+            "a bootstrap node cannot run keyshare, aggregation, registry, or contract-writer \
+             components"
+        );
+        Ok(())
+    }
 
     fn resolve_bus(&self) -> Addr<EventBus<InterfoldEvent>> {
         match self.source_bus {
@@ -1048,6 +1088,10 @@ impl CiphernodeBuilder {
                 let provider = provider_cache.ensure_read_provider(chain).await?;
                 let chain_id = provider.chain_id();
                 validate_chain_id(chain, chain_id)?;
+                // Only the accusation manager uses the vote validity, and a bootstrap node has none.
+                if self.role == NodeRole::Bootstrap {
+                    continue;
+                }
                 let validity =
                     Self::fetch_accusation_vote_validity_from_registry(provider_cache, chain)
                         .await?;
@@ -1210,6 +1254,12 @@ impl CiphernodeBuilder {
                 sortition,
                 self.proof_aggregation_enabled,
             ));
+        }
+
+        // A bootstrap node verifies no proofs and must not sign accusation votes, so it gets
+        // neither slashing extension.
+        if self.role == NodeRole::Bootstrap {
+            return Ok(e3_builder);
         }
 
         // ── Accusation manager ──
@@ -2347,5 +2397,39 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("snapshots disagree"));
+    }
+
+    #[actix::test]
+    async fn a_bootstrap_node_rejects_committee_components() -> anyhow::Result<()> {
+        let cipher =
+            std::sync::Arc::new(e3_crypto::Cipher::from_password("test-only-bootstrap").await?);
+        let node = || {
+            super::CiphernodeBuilder::new(e3_test_helpers::derive_shared_rng(1, 1), cipher.clone())
+        };
+        let bootstrap = || node().with_bootstrap_role();
+
+        assert!(bootstrap()
+            .with_contract_interfold_reader()
+            .ensure_role_components()
+            .is_ok());
+        for builder in [
+            bootstrap().with_trbfv(),
+            bootstrap().with_pubkey_aggregation(),
+            bootstrap().with_threshold_plaintext_aggregation(),
+            bootstrap().with_contract_interfold_full(),
+            bootstrap().with_contract_ciphernode_registry(),
+            bootstrap().with_contract_bonding_registry(),
+            bootstrap().with_contract_slashing_manager(),
+        ] {
+            let error = builder.ensure_role_components().unwrap_err();
+            assert!(error.to_string().contains("a bootstrap node cannot run"));
+        }
+        assert!(node()
+            .with_trbfv()
+            .with_pubkey_aggregation()
+            .with_contract_interfold_full()
+            .ensure_role_components()
+            .is_ok());
+        Ok(())
     }
 }

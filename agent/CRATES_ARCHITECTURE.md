@@ -238,6 +238,32 @@ sequenceDiagram
     EP-->>CLI: ready node
 ```
 
+`interfold start --bootstrap` builds a bootstrap node with the same builder and
+`with_bootstrap_role()`. It enables persistence, the Interfold contract reader, and the libp2p
+interface. It has no compute scheduler (so no prover-memory check), TrBFV keyshare, ZK prover,
+aggregators, registry or bonding readers, or contract writers, and `setup_extensions` installs no
+`AccusationManager` or `CommitmentConsistencyChecker`, so it signs no votes. The parts that the
+builder runs for every node still run: sortition, the request router with the aggregator-role
+extension, the E3 lifecycle coordinator, and per-chain data-availability coordination. It still
+needs a wallet key. The builder derives the node address and the HLC node id from it, and
+`wallet set` derives the libp2p keypair from the same key. It fetches peer history at startup like a
+full node, but `NetSyncManager` continues without that history when no peer serves it
+(`peer_history_optional`), so a seed without a reachable peer still starts while an E3 is open. A
+full node keeps waiting for that history. It serves discovery, gossip, DHT documents, and history
+like a full node (`crates/entrypoint/src/start/start.rs`).
+
+After schema admission, `preflight_node_role` stamps `//node_role` on a new data directory, which is
+one whose schema marker this startup wrote. A directory without the role marker that existed before
+this startup belongs to a full node, because releases without the marker ran only full nodes; its
+key/value store can hold chain cursors even when its event log is empty. A node refuses a directory
+of the other role, and `ensure_role_components` rejects a bootstrap builder that also enables
+keyshare, aggregation, registry, or contract-writer components. A bootstrap node advances the
+per-chain block cursor with only the Interfold reader, so a full node started on its directory would
+skip earlier registry events. A bootstrap node started on a full node's directory would restore that
+node's committees. The marker is read with `read_checked`, so a storage error cannot pass as an
+unmarked directory. Releases without the marker share schema version 7 and do not check it
+(`crates/sync/src/sync/preflight.rs`).
+
 Startup has a configured outer deadline. The EVM and network startup buffers expose readiness
 failures; a bound overflow fails startup instead of silently discarding protocol observations.
 Effects remain disabled until durable replay and both historical sources have been merged in HLC
