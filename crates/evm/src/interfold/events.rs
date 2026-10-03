@@ -30,7 +30,7 @@ fn crypto_config_id(params: &[u8]) -> B256 {
         (
             keccak256(b"fhe.rs:BFV"),
             keccak256(params),
-            keccak256(b"interfold-bfv-v1"),
+            keccak256(b"interfold-bfv-v3"),
         )
             .abi_encode(),
     )
@@ -522,11 +522,11 @@ mod tests {
         let expected = [
             (
                 0,
-                "0x04f3677e73b0f5066d6caf5cbd92e3fb2e38338edaf5cfc971ab28f7b684da78",
+                "0x20d76557cc2aee078754ad9a563d61d0697809da363f1979895ec15f6ea30db9",
             ),
             (
                 1,
-                "0xd9c86e581f8291ffb5b63595600e8d096ed30b16e2e0a6634a76c22b1f58fb4e",
+                "0x3115e08eb5c87d6d245eda5dff0cf377c42e29b9741f94fc7a83efc3da7da920",
             ),
         ];
 
@@ -554,10 +554,29 @@ mod tests {
                 cryptoConfigId: expected_id.parse::<B256>().unwrap(),
             };
 
-            let converted = E3RequestedWithChainId(event, 1)
+            let converted = E3RequestedWithChainId(event.clone(), 1)
                 .try_into_e3_requested()
                 .unwrap();
             assert_eq!(converted.params_preset, preset);
+
+            let params = encode_bfv_params(&BfvParamSet::from(preset).build_arc());
+            for version in [b"interfold-bfv-v1", b"interfold-bfv-v2"] {
+                let mut legacy_event = event.clone();
+                legacy_event.cryptoConfigId = keccak256(
+                    (
+                        keccak256(b"fhe.rs:BFV"),
+                        keccak256(&params),
+                        keccak256(version),
+                    )
+                        .abi_encode(),
+                );
+                let error = E3RequestedWithChainId(legacy_event, 1)
+                    .try_into_e3_requested()
+                    .unwrap_err();
+                assert!(error
+                    .to_string()
+                    .contains("Unsupported crypto configuration"));
+            }
         }
     }
 

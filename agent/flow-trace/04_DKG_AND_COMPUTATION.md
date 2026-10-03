@@ -363,8 +363,37 @@ stores and what gets ECDSA-signed for gossip (`ProofType::C2aSkShareComputation`
 `circuits/bin/recursive_aggregation/` (e.g. `c2ab_fold`, `c3ab_fold`, `c6_fold`, `node_fold`,
 `nodes_fold`, `dkg_aggregator`, `decryption_aggregator` — `nodes_fold` chains `H` `node_fold` proofs
 for `dkg_aggregator`; `decryption_aggregator` folds C6 via non-ZK `c6_fold` then checks C7 with ZK).
-The per-circuit `wrapper/` Noir step was removed; aggregator response structs no longer carry a
-`wrapped_proof` field — the inner recursive proof itself is what flows between stages.
+
+`node_fold::assert_c3_recipient_keys` pins every non-self recipient limb to that recipient's
+limb-zero key. It also requires C3a and C3b keys to match in every slot. The fold exports limb zero,
+and `dkg_aggregator::assert_selected_c0_c3_links` binds that export to the recipient's C0 key. The
+node's own recipient slot is exempt because its exported key comes directly from C0. The per-circuit
+`wrapper/` Noir step was removed; aggregator response structs no longer carry a `wrapped_proof`
+field — the inner recursive proof itself is what flows between stages.
+
+Sequential C3, C6, and nodes folds expose the fixed `(leaf, fold, genesis)` VK hashes before
+`is_first_step` and `slot_index`. `predecessor_key_hash` requires the predecessor to carry the same
+three hashes. The first step verifies the genesis VK. Each continuation verifies the fold VK. The
+final consumer also requires the declared fold hash to match the VK that verified its proof.
+
+`compute_vk_hash` uses the SAFE `DS_VK_HASH` sponge and preserves input order. The DKG trust anchor
+includes every descendant key:
+
+```text
+C2 tree    = hash(C2a, C2b)
+C3 chain   = hash(c3_fold, c3_fold_kernel, C3)
+C3 tree    = hash(C3a chain, C3b chain)
+C4 tree    = hash(C4a, C4b)
+node tree  = hash(C0, C1, c2ab_fold, C2 tree, c3ab_fold, C3 tree, c4ab_fold, C4 tree)
+nodes tree = hash(nodes_fold, nodes_fold_kernel, node_fold, node tree)
+C6 tree    = hash(c6_fold, c6_fold_kernel, C6)
+```
+
+The builder derives `nodes_fold.vk_tree_hash` and `c6_fold.vk_tree_hash` from each complete artifact
+pair. `dkg_aggregator` requires every folded node row to carry the same node-tree hash. Both final
+aggregators expose their complete tree anchor at public input zero. The immutable wrapper pin comes
+from the matching tree-hash file, not the immediate fold VK. Public input one retains the separate
+C5 or C7 non-ZK recursive VK hash. The final EVM public-input layouts do not change.
 
 **Ciphernode / aggregator integration:** `ZkRequest::FoldProofs` was removed. The multithread actor
 implements `ZkRequest::NodeDkgFold` (full per-node pipeline to a `NodeFold` proof),
@@ -840,7 +869,7 @@ phase.
         │  │         pkCommitment, committeeHash, proof          │
         │  │       ), InvalidProof())                            │
         │  │       → BFV: `BfvPkVerifier` (DkgAggregator Honk)  │
-        │  │         • M-34: immutable nodesFold / C5 VK hashes  │
+        │  │         • M-34: immutable nodes tree / C5 VK hashes │
         │  │           checked against publicInputs[0..1]        │
         │  │         • C-08: committee_hash_hi/lo (slots         │
         │  │           [2+H] & [3+H]) vs committeeHash           │
@@ -1317,7 +1346,7 @@ InterfoldSolReader decodes CiphertextOutputPublished event
         │  │         domain already committed by every C6 leaf.  │
          │  │       → IF-003: e3Id resolves stored DKG anchors;  │
          │  │       │  proof party IDs and SK/ESM commitments match.│
-         │  │       → M-34: c6Fold / C7 VK hashes are immutable.  │
+          │  │       → M-34: C6 tree / C7 VK hashes are immutable. │
         │  │       → M-35: revert path only (no `bool false`).   │
         │  │    5. stage = Complete                              │
         │  │    6. _distributeRewards(e3Id)                      │
@@ -1377,9 +1406,12 @@ InterfoldSolReader decodes CiphertextOutputPublished event
 │      │                            │                   │ correctly                    │
 ├──────┼────────────────────────────┼───────────────────┼──────────────────────────────┤
 │ C1   │ TrBFV PK Generation        │ DKG: Share Gen    │ Threshold pk_share derived   │
-│      │                            │                   │ correctly from sk; outputs   │
-│      │                            │                   │ sk_commitment, pk_commitment,│
-│      │                            │                   │ e_sm_commitment              │
+│      │                            │                   │ correctly from sk; bounds    │
+│      │                            │                   │ e_sm over the integers via   │
+│      │                            │                   │ e_sm_lifted + CRT quotients; │
+│      │                            │                   │ outputs sk_commitment,       │
+│      │                            │                   │ pk_commitment,               │
+│      │                            │                   │ e_sm_commitment (residues)   │
 ├──────┼────────────────────────────┼───────────────────┼──────────────────────────────┤
 │ C2a  │ SK Share Computation       │ DKG: Share Gen    │ Shamir shares of sk computed │
 │      │                            │                   │ correctly                    │
@@ -1388,15 +1420,18 @@ InterfoldSolReader decodes CiphertextOutputPublished event
 │      │                            │                   │ noise computed correctly     │
 ├──────┼────────────────────────────┼───────────────────┼──────────────────────────────┤
 │ C3a  │ SK Share Encryption        │ DKG: Share Gen    │ sk_sss encrypted correctly   │
-│      │                            │                   │ under recipient's BFV key   │
+│      │                            │                   │ under recipient's BFV key;   │
+│      │                            │                   │ e0 used directly, no CRT     │
+│      │                            │                   │ split (e0_bound < q_i/2)     │
 ├──────┼────────────────────────────┼───────────────────┼──────────────────────────────┤
 │ C3b  │ ESM Share Encryption       │ DKG: Share Gen    │ esi_sss encrypted correctly  │
-│      │                            │                   │ under recipient's BFV key   │
+│      │                            │                   │ under recipient's BFV key;   │
+│      │                            │                   │ same e0 handling as C3a      │
 ├──────┼────────────────────────────┼───────────────────┼──────────────────────────────┤
 │ C4a  │ SK Decryption Share (T2)   │ DKG: Key Calc     │ Verifies H decrypted shares  │
 │      │                            │                   │ match C2a commitments; sums  │
-│      │                            │                   │ and normalises (reduce mod   │
-│      │                            │                   │ q, reverse, center) before   │
+│      │                            │                   │ reverses and centre-reduces  │
+│      │                            │                   │ in one bounded division      │
 │      │                            │                   │ hashing; output commitment   │
 │      │                            │                   │ consumed by C6               │
 ├──────┼────────────────────────────┼───────────────────┼──────────────────────────────┤
@@ -1806,6 +1841,12 @@ published ciphertext = addend + ballot ciphertext
 ```
 
 The ballot is a fresh BFV encryption of `k1`, covered by the recursive `user_data_encryption` proof.
+The SDK passes the WASM-generated reduction quotients as `r` for ct0 and `r_ct1` for ct1.
+`CRISPProgram._verifyInputProof` supplies `e3.committeePublicKey` as `noirPublicInputs[8]`. This
+anchors the ballot proof's public-key commitment to the C5-proven key for that round. The caller
+cannot supply a replacement key. The ballot circuits bound both public-key components before
+commitment generation, so their packed openings are injective.
+
 The addend is the slot's current head for a mask, and the zero ciphertext for a vote, a re-vote, or
 any input to an empty slot. `is_mask_vote` chooses between them and is **private**, and the selector
 is derived (`keep_previous = is_mask_vote & !is_first_vote`) rather than taken as a witness — so a

@@ -451,12 +451,18 @@ async fn store_committee_public_key<S: DataStore, R: ProviderType>(
         (
             keccak256(b"fhe.rs:BFV"),
             keccak256(&e3_params),
-            keccak256(b"interfold-bfv-v1"),
+            keccak256(b"interfold-bfv-v3"),
         )
             .abi_encode(),
     );
     let request_crypto_config_id = contract.get_e3_crypto_config_id(event.e3Id).await?;
     if request_crypto_config_id != crypto_config_id {
+        if ignore_invalid_candidate {
+            warn!(
+                "Ignoring committee key for unsupported request-time configuration of E3 {e3_id}"
+            );
+            return Ok(false);
+        }
         return Err(eyre!(
             "local circuit configuration does not match request-time config for E3 {e3_id}"
         ));

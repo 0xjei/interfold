@@ -21,12 +21,20 @@ every section.
   the push of a branch that differs from HEAD in a path of that file. CI reads the same file to
   start `build_circuits`, which hydrates and compares every supported preset and committee pair. A
   drift means a deployed verifier accepts a different circuit from the tree.
+- Complete artifact pairs include `nodes_fold.vk_tree_hash` and `c6_fold.vk_tree_hash`. The builder
+  derives them from the recursive leaf VKs and non-ZK fold VKs after a complete build with keys.
+  Every other build (a `--group` or `--circuit` subset, `--skip-vk`, or a failed circuit) removes
+  both files from the pair and from `circuits/bin/`, because an old anchor can hash a key that the
+  build replaced. Hydration copies both files into `circuits/bin/`. Build-cache markers and release
+  validation require both files. Deployment uses them as public-input-zero pins and retains the
+  separate C5/C7 VK pins. — `scripts/build-circuits.ts`; `scripts/circuit-artifacts.ts`;
+  `scripts/utils.ts`
 - `pnpm store:circuits pull` selects the newest first-parent `circuit-artifacts` commit whose
   `SOURCE_HASH` matches the current source tree. A different build at the branch tip must not
   replace it. The release workflow archives the branch tip and fails if the tip's hash differs.
   Release verification still checks the source hash, every required pair, and each pair's build
-  stamp. **Gap:** `SOURCE_HASH` does not cover the shared Noir library (see `02_CRYPTO_CIRCUITS.md`
-  §Noir / Barretenberg compatibility).
+  stamp. `SOURCE_HASH` includes the shared Noir library and its dependency manifest (see
+  `02_CRYPTO_CIRCUITS.md` §Noir / Barretenberg compatibility).
 - **`Elf.sol` is never committed.** `crates/support/methods/build.rs` writes it with a machine-local
   guest ELF path, so it is generated per checkout and `.gitignore`d.
 - **A release publishes a complete provenance manifest** — `pnpm provenance:manifest`. It ties

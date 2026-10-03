@@ -122,11 +122,11 @@ export interface ActiveBfvConfig {
 const INSECURE_PARAM_SET_HASH =
   "0x18c6d8650486b997d48aa2d285fae878fb267b268332d056a3e8527d50e87b4f";
 const INSECURE_CONFIG_ID =
-  "0x04f3677e73b0f5066d6caf5cbd92e3fb2e38338edaf5cfc971ab28f7b684da78";
+  "0x20d76557cc2aee078754ad9a563d61d0697809da363f1979895ec15f6ea30db9";
 const SECURE_PARAM_SET_HASH =
   "0xd7068fdcc1910f5e49c8b05530cf74f876cadee2a1caf797a40b1ae53ae143ec";
 const SECURE_CONFIG_ID =
-  "0xd9c86e581f8291ffb5b63595600e8d096ed30b16e2e0a6634a76c22b1f58fb4e";
+  "0x3115e08eb5c87d6d245eda5dff0cf377c42e29b9741f94fc7a83efc3da7da920";
 
 function bfvConfig(
   preset: BfvArtifactPreset,
@@ -286,14 +286,14 @@ function distCircuitRoot(config: ActiveBfvConfig): string {
   );
 }
 
-/** Recursive VK hashes for `BfvPkVerifier` sub-circuits. */
+/** Complete nodes-fold VK-tree anchor and C5 recursive VK hash. */
 export function getBfvPkSubCircuitVkHashPaths(config?: ActiveBfvConfig) {
   if (config) {
     const root = distCircuitRoot(config);
     return {
       nodesFold: path.join(
         root,
-        "default/recursive_aggregation/nodes_fold/nodes_fold.vk_hash",
+        "default/recursive_aggregation/nodes_fold/nodes_fold.vk_tree_hash",
       ),
       c5: path.join(
         root,
@@ -306,7 +306,7 @@ export function getBfvPkSubCircuitVkHashPaths(config?: ActiveBfvConfig) {
   return {
     nodesFold: path.join(
       root,
-      "circuits/bin/recursive_aggregation/nodes_fold/target/nodes_fold.vk_recursive_hash",
+      "circuits/bin/recursive_aggregation/nodes_fold/target/nodes_fold.vk_tree_hash",
     ),
     c5: path.join(
       root,
@@ -315,7 +315,7 @@ export function getBfvPkSubCircuitVkHashPaths(config?: ActiveBfvConfig) {
   } as const;
 }
 
-/** Recursive VK hashes for `BfvDecryptionVerifier` sub-circuits. */
+/** Complete C6-fold VK-tree anchor and C7 recursive VK hash. */
 export function getBfvDecryptionSubCircuitVkHashPaths(
   config?: ActiveBfvConfig,
 ) {
@@ -324,7 +324,7 @@ export function getBfvDecryptionSubCircuitVkHashPaths(
     return {
       c6Fold: path.join(
         root,
-        "default/recursive_aggregation/c6_fold/c6_fold.vk_hash",
+        "default/recursive_aggregation/c6_fold/c6_fold.vk_tree_hash",
       ),
       c7: path.join(
         root,
@@ -337,7 +337,7 @@ export function getBfvDecryptionSubCircuitVkHashPaths(
   return {
     c6Fold: path.join(
       root,
-      "circuits/bin/recursive_aggregation/c6_fold/target/c6_fold.vk_recursive_hash",
+      "circuits/bin/recursive_aggregation/c6_fold/target/c6_fold.vk_tree_hash",
     ),
     c7: path.join(
       root,
@@ -347,8 +347,8 @@ export function getBfvDecryptionSubCircuitVkHashPaths(
 }
 
 /**
- * Reads a 32-byte recursive VK hash emitted by the circuit build (`*.vk_recursive_hash`).
- * Co-redeploy `BfvPkVerifier` / `BfvDecryptionVerifier` when the corresponding sub-circuit VK changes.
+ * Read a 32-byte recursive VK hash or complete VK-tree anchor from the circuit build.
+ * Replace the corresponding BFV wrapper when any anchored descendant VK changes.
  */
 export function readVkRecursiveHash(
   filePath: string,
@@ -386,7 +386,7 @@ export interface BfvDecryptionVerifierVkReader {
 }
 
 /**
- * Ensures deployed `BfvPkVerifier` immutables match current `*.vk_recursive_hash` artifacts.
+ * Check the deployed DKG tree and C5 pins against the selected artifact pair.
  * Call when reusing an address from `deployed_contracts.json` after `pnpm compile:circuits`.
  */
 export async function assertBfvPkVerifierSubCircuitVkHashes(
@@ -420,7 +420,7 @@ export async function assertBfvPkVerifierSubCircuitVkHashes(
 }
 
 /**
- * Ensures deployed `BfvDecryptionVerifier` immutables match current `*.vk_recursive_hash` artifacts.
+ * Check the deployed C6 tree and C7 pins against the selected artifact pair.
  */
 export async function assertBfvDecryptionVerifierSubCircuitVkHashes(
   verifier: BfvDecryptionVerifierVkReader,
