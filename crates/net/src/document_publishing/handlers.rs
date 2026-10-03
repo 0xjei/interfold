@@ -19,8 +19,11 @@ impl Handler<InterfoldEvent> for DocumentPublisher {
         let source = msg.source();
         let (msg, ec) = msg.into_components();
         match msg {
-            InterfoldEventData::EffectsEnabled(_) => {
-                self.effects_enabled = true;
+            // Startup publishes chain history between `EffectsEnabled` and `SyncEnded`. A
+            // publication that starts earlier can announce or upload a document of an E3 whose
+            // closing stage is still in that history.
+            InterfoldEventData::SyncEnded(_) if !self.publishing_enabled => {
+                self.publishing_enabled = true;
                 for id in self.publications.keys() {
                     self.start_publication(id, ctx);
                 }
@@ -72,6 +75,9 @@ impl Handler<TypedEvent<PublishDocumentRequested>> for DocumentPublisher {
             msg.meta.e3_id.clone(),
             ContentHash::from_content(&msg.value),
         );
+        // Publications wait for `SyncEnded`, and replay brings back requests that may have
+        // expired, so an expired publication must not take the outbox or this document's place.
+        self.remove_expired_publications(ctx);
         if self.closed_e3s.contains(&msg.meta.e3_id) || self.publications.contains_key(&id) {
             return;
         }
@@ -89,7 +95,7 @@ impl Handler<TypedEvent<PublishDocumentRequested>> for DocumentPublisher {
         self.publication_bytes += size;
         self.publications
             .insert(id.clone(), Publication::new(msg.into_inner()));
-        if self.effects_enabled {
+        if self.publishing_enabled {
             self.start_publication(&id, ctx);
         }
     }
