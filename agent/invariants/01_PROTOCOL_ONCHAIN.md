@@ -457,7 +457,12 @@ every section.
   `flow-trace/04`, `05`; INDEX concerns Z-32, ZEN2-04, ZEN2-26
 - Accusation quorum: `agree_count >= H`; the implementation derives `H` from the committee enum
   because the legacy E3 field `threshold_m` carries circuit threshold `T`. Voters must be active
-  committee members, and all votes must agree. Lane A is **attestation-based** (ECDSA per voter),
+  committee members, and all votes must agree. Local accusations reject the accuser's own address or
+  finalized party ID. Received accusations reject equal signed accuser and accused addresses.
+  `accused_party_id` is not in the accusation digest and cannot decide received self-accusation
+  admission. Forwarded payloads are admitted only for C3a/C3b; other proof types require local
+  evidence without a forwarded payload. These checks precede evidence caching, vote creation, and
+  pending-window changes in `AccusationVoting`. Lane A is **attestation-based** (ECDSA per voter),
   not on-chain ZK re-verification. Vote digest / EIP-712 type hashes must match the Solidity
   constants exactly (Rust ↔ Solidity). — `flow-trace/05`; `SlashingManager.sol`
 - Staggered slash submission: agreeing voters rank by ascending address. Ranks 0–2 submit, and rank
