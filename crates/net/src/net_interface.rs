@@ -49,7 +49,9 @@ use libp2p::{
         self, cbor, Event as RequestResponseEvent, Message as RequestResponseMessage,
         ProtocolSupport,
     },
-    swarm::{dial_opts::DialOpts, DialError, ListenError, NetworkBehaviour, SwarmEvent},
+    swarm::{
+        dial_opts::DialOpts, ConnectionId, DialError, ListenError, NetworkBehaviour, SwarmEvent,
+    },
     Multiaddr, Swarm,
 };
 use rand::prelude::IteratorRandom;
@@ -93,6 +95,8 @@ const DHT_EXPIRY_INTERVAL: Duration = Duration::from_secs(60);
 const DHT_PUT_SUMMARY_INTERVAL: Duration = Duration::from_secs(60);
 pub(crate) const EVENT_CHANNEL_SIZE: usize = 1000;
 const CMD_CHANNEL_SIZE: usize = 1000;
+const MAX_IDENTIFY_ADDRESSES: usize = 8;
+const MAX_IDENTIFY_ADDRESS_BYTES: usize = 2 * 1024;
 const LIBP2P_ESTABLISHED_PER_PEER_LIMIT_TEXT: &str = "established connections per peer";
 
 type GossipBehaviour =
@@ -205,6 +209,99 @@ fn strip_peer_id(mut addr: Multiaddr) -> Multiaddr {
         addr.pop();
     }
     addr
+}
+
+#[derive(Default)]
+struct PeerAddresses {
+    identify: Vec<Multiaddr>,
+    connections: HashMap<ConnectionId, Multiaddr>,
+}
+
+impl PeerAddresses {
+    fn refresh(
+        &mut self,
+        peer: libp2p::PeerId,
+        advertised: Vec<Multiaddr>,
+        filter_loopback: bool,
+        kademlia: &mut KademliaBehaviour<MemoryStore>,
+    ) {
+        let mut advertised: Vec<_> = advertised
+            .into_iter()
+            .map(|address| strip_peer_id(address).with(Protocol::P2p(peer)))
+            .collect();
+        // Keep advertised live endpoints first so they remain available after disconnect.
+        advertised.sort_by_key(|address| !self.connections.values().any(|live| live == address));
+        let mut next = Vec::new();
+        let mut bytes = 0;
+        for address in advertised {
+            if filter_loopback && is_loopback_addr(&address) {
+                continue;
+            }
+            if next.contains(&address) || bytes + address.len() > MAX_IDENTIFY_ADDRESS_BYTES {
+                continue;
+            }
+            bytes += address.len();
+            next.push(address);
+            if next.len() == MAX_IDENTIFY_ADDRESSES {
+                break;
+            }
+        }
+
+        // Remove old advertisements before inserting the bounded replacement. Live endpoints
+        // stay until their connection closes, even when Identify no longer advertises them.
+        let retired: Vec<_> = self
+            .identify
+            .iter()
+            .filter(|address| {
+                !next.contains(address) && !self.connections.values().any(|live| live == *address)
+            })
+            .cloned()
+            .collect();
+        remove_kademlia_addresses(kademlia, peer, &retired);
+        for address in &next {
+            kademlia.add_address(&peer, address.clone());
+        }
+        self.identify = next;
+    }
+}
+
+fn remove_kademlia_addresses(
+    kademlia: &mut KademliaBehaviour<MemoryStore>,
+    peer: libp2p::PeerId,
+    removed: &[Multiaddr],
+) {
+    if removed.is_empty() {
+        return;
+    }
+    // Kademlia can insert a dial endpoint without its peer ID, but remove_address only matches
+    // qualified addresses. Rebuild this entry to remove both forms and normalize the survivors.
+    if let Some(entry) = kademlia.remove_peer(&peer) {
+        for address in entry.node.value.into_vec() {
+            let address = strip_peer_id(address).with(Protocol::P2p(peer));
+            if !removed.contains(&address) {
+                kademlia.add_address(&peer, address);
+            }
+        }
+    }
+}
+
+fn prune_peer_addresses(
+    peers: &mut HashMap<libp2p::PeerId, PeerAddresses>,
+    kademlia: &mut KademliaBehaviour<MemoryStore>,
+) {
+    peers.retain(|peer, addresses| {
+        if !addresses.connections.is_empty()
+            || kademlia
+                .kbucket(*peer)
+                .is_some_and(|bucket| bucket.iter().any(|entry| entry.node.key.preimage() == peer))
+        {
+            return true;
+        }
+        // A disconnected peer without a routing entry needs no tracking. Remove any pending
+        // insertion as well, so it cannot later retain addresses whose ownership we forgot.
+        kademlia.remove_peer(peer);
+        false
+    });
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -386,6 +483,7 @@ impl Libp2pNetInterface {
         let mut correlator = Correlator::new();
         let mut peer_failures = PeerConnectionFailures::new();
         let mut peer_admission = PeerAdmission::default();
+        let mut peer_addresses = HashMap::<libp2p::PeerId, PeerAddresses>::new();
         let mut dht_records_by_peer: HashMap<libp2p::PeerId, HashSet<Vec<u8>>> = HashMap::new();
         let mut seen_gossip = SeenIds::new(SEEN_GOSSIP_TTL, SEEN_GOSSIP_CAPACITY);
         let mut admission_tick = tokio::time::interval(Duration::from_secs(5));
@@ -481,6 +579,7 @@ impl Libp2pNetInterface {
                             });
                         }
                     }
+                    prune_peer_addresses(&mut peer_addresses, &mut self.swarm.behaviour_mut().kademlia);
                 }
                 _ = dht_expiry_tick.tick() => {
                     prune_expired_dht_records(&mut self.swarm);
@@ -554,6 +653,7 @@ impl Libp2pNetInterface {
                         &mut correlator,
                         &mut peer_failures,
                         &mut peer_admission,
+                        &mut peer_addresses,
                         &mut configured_peers,
                         &mut dht_records_by_peer,
                         &mut seen_gossip,
@@ -687,7 +787,8 @@ fn create_behaviour(
                 "interfold-ciphernode/{}",
                 env!("CARGO_PKG_VERSION")
             ))
-            .with_interval(Duration::from_secs(60)),
+            .with_interval(Duration::from_secs(60))
+            .with_cache_size(0),
     );
 
     let gossipsub_config = gossipsub::ConfigBuilder::default()
@@ -707,13 +808,15 @@ fn create_behaviour(
         filter,
     )?;
     let mut score_params = gossipsub::PeerScoreParams::default();
-    let mut topic_score = gossipsub::TopicScoreParams::default();
-    topic_score.time_in_mesh_quantum = Duration::from_secs(1);
-    topic_score.time_in_mesh_cap = 10.0;
-    topic_score.first_message_deliveries_cap = 100.0;
-    topic_score.mesh_message_deliveries_weight = 0.0;
-    topic_score.mesh_failure_penalty_weight = 0.0;
-    topic_score.invalid_message_deliveries_weight = -10.0;
+    let topic_score = gossipsub::TopicScoreParams {
+        time_in_mesh_quantum: Duration::from_secs(1),
+        time_in_mesh_cap: 10.0,
+        first_message_deliveries_cap: 100.0,
+        mesh_message_deliveries_weight: 0.0,
+        mesh_failure_penalty_weight: 0.0,
+        invalid_message_deliveries_weight: -10.0,
+        ..Default::default()
+    };
     score_params.topics.insert(topic.hash(), topic_score);
     gossipsub
         .with_peer_score(score_params, gossipsub::PeerScoreThresholds::default())
@@ -770,6 +873,7 @@ fn create_behaviour(
 }
 
 /// Process all swarm events
+#[allow(clippy::too_many_arguments)]
 async fn process_swarm_event(
     swarm: &mut Swarm<NodeBehaviour>,
     event_tx: &NetEventSender,
@@ -777,6 +881,7 @@ async fn process_swarm_event(
     correlator: &mut Correlator,
     peer_failures: &mut PeerConnectionFailures,
     peer_admission: &mut PeerAdmission,
+    peer_addresses: &mut HashMap<libp2p::PeerId, PeerAddresses>,
     configured_peers: &mut [ConfiguredPeer],
     dht_records_by_peer: &mut HashMap<libp2p::PeerId, HashSet<Vec<u8>>>,
     seen_gossip: &mut SeenIds<gossipsub::MessageId>,
@@ -796,6 +901,14 @@ async fn process_swarm_event(
             // The authenticated transport identity is necessary but not sufficient. Keep the
             // connection staged until Identify confirms the Interfold network and capabilities.
             let remote_addr = endpoint.get_remote_address().clone();
+            peer_addresses
+                .entry(peer_id)
+                .or_default()
+                .connections
+                .insert(
+                    connection_id,
+                    strip_peer_id(remote_addr.clone()).with(Protocol::P2p(peer_id)),
+                );
             let direction = if endpoint.is_dialer() {
                 "outbound"
             } else {
@@ -989,7 +1102,7 @@ async fn process_swarm_event(
             request:
                 InboundRequest::PutRecord {
                     source,
-                    record: Some(record),
+                    record: Some(mut record),
                     ..
                 },
         })) => {
@@ -1012,13 +1125,25 @@ async fn process_swarm_event(
                 && key_matches
                 && within_quota
             {
-                let key_exists = swarm
-                    .behaviour_mut()
-                    .kademlia
-                    .store_mut()
-                    .get(&record.key)
-                    .is_some();
-                match swarm.behaviour_mut().kademlia.store_mut().put(record) {
+                let local_peer_id = *swarm.local_peer_id();
+                let store = swarm.behaviour_mut().kademlia.store_mut();
+                let key_exists = if let Some(existing) = store.get(&record.key) {
+                    // Remote puts cannot replace our publications or shorten a replica's lifetime.
+                    if existing.publisher == Some(local_peer_id)
+                        || existing.expires.is_none()
+                        || existing.expires >= record.expires
+                    {
+                        return Ok(());
+                    }
+                    record = Record {
+                        expires: record.expires,
+                        ..existing.into_owned()
+                    };
+                    true
+                } else {
+                    false
+                };
+                match store.put(record) {
                     Ok(()) if !key_exists => {
                         peer_keys.insert(key_bytes);
                     }
@@ -1345,8 +1470,20 @@ async fn process_swarm_event(
                 return Ok(());
             }
 
-            let Some(pending_connections) = peer_admission.admit(peer_id) else {
-                debug!(%peer_id, "Received Identify for an admitted or unstaged peer");
+            let pending_connections = peer_admission.admit(peer_id);
+            if !peer_admission.is_admitted(&peer_id) {
+                debug!(%peer_id, "Received Identify for an unstaged peer");
+                return Ok(());
+            }
+            let filter = should_filter_loopback(swarm);
+            peer_addresses.entry(peer_id).or_default().refresh(
+                peer_id,
+                info.listen_addrs,
+                filter,
+                &mut swarm.behaviour_mut().kademlia,
+            );
+            trace!(observed_address = %info.observed_addr, "Peer reported our observed address");
+            let Some(pending_connections) = pending_connections else {
                 return Ok(());
             };
             peer_failures.connection_succeeded(&peer_id);
@@ -1366,7 +1503,6 @@ async fn process_swarm_event(
                 status_pending.direction,
                 status_pending.connections,
             );
-            let filter = should_filter_loopback(swarm);
             for pending in &pending_connections {
                 if !(filter && is_loopback_addr(&pending.remote_address)) {
                     swarm
@@ -1375,15 +1511,6 @@ async fn process_swarm_event(
                         .add_address(&peer_id, strip_peer_id(pending.remote_address.clone()));
                 }
             }
-            for addr in &info.listen_addrs {
-                if !(filter && is_loopback_addr(addr)) {
-                    swarm
-                        .behaviour_mut()
-                        .kademlia
-                        .add_address(&peer_id, strip_peer_id(addr.clone()));
-                }
-            }
-            trace!(observed_address = %info.observed_addr, "Peer reported our observed address");
             let topic = gossipsub::IdentTopic::new(network.protocols().gossip_topic()).hash();
             // The subscribe event of a peer that subscribed before its admission was ignored.
             let subscribed_before_admission = swarm
@@ -1431,6 +1558,20 @@ async fn process_swarm_event(
             ..
         } => {
             peer_admission.closed(&peer_id, connection_id, num_established);
+            if let Some(addresses) = peer_addresses.get_mut(&peer_id) {
+                if let Some(address) = addresses.connections.remove(&connection_id) {
+                    if !addresses.identify.contains(&address)
+                        && !addresses.connections.values().any(|live| live == &address)
+                    {
+                        remove_kademlia_addresses(
+                            &mut swarm.behaviour_mut().kademlia,
+                            peer_id,
+                            &[address],
+                        );
+                    }
+                }
+            }
+            prune_peer_addresses(peer_addresses, &mut swarm.behaviour_mut().kademlia);
             status.disconnected(&peer_id.to_string(), num_established);
             if num_established == 0 {
                 let total = swarm.connected_peers().count();
