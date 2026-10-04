@@ -203,7 +203,7 @@ the code does not meet yet.
   `flow-trace/04`; `flow-trace/06`
 - Correctness-critical sends are acknowledged and timeout-bounded; `do_send` is allowed only for
   best-effort telemetry. Buffers are bounded by both item count and bytes with an explicit overflow
-  policy. **Gap:** 84 `.do_send(` call sites remain (the count covers all sites, not only
+  policy. **Gap:** 82 `.do_send(` call sites remain (the count covers all sites, not only
   correctness paths), including `BusHandle` publication, `Sequencer`, `DataStore::write`, snapshot
   batches, EVM routing, and keyshare collectors. `pnpm check:invariants` blocks growth of the total
   only. The request router's `EventBuffer` has no bound either: it keeps every event of an E3 for
@@ -230,6 +230,15 @@ the code does not meet yet.
   Retry the exact ZK request, preserve its durable input, and let canonical E3 lifecycle facts end
   recovery. Only a completed cryptographic check can classify a peer proof as invalid. —
   `flow-trace/04`
+- C0 recovery scans durable inputs and local outcomes before actor startup, including events before
+  the snapshot cursor. It skips legacy records that the EventStore router quarantines, but rejects
+  other sequence gaps. An empty filtered page is not end-of-log until the physical cursor passes the
+  log head. Recovery advances one physical record at a time across empty pages, including pages
+  limited by decoded bytes. Later C0 inputs remain recoverable. It applies the live admission checks
+  and excludes E3s past DKG. Recovered and replayed C0 inputs dispatch only after `EffectsEnabled`;
+  document deduplication cannot erase unresolved verification work. Local failures retry with a
+  delay that doubles from 5 to 60 seconds. `E3RequestComplete` cancels the retries. —
+  `crates/zk-prover/src/proof_verification/recovery.rs`; `flow-trace/06`
 - Sortition delays, committee-finalization timers, and slash submissions persist their semantic
   inputs before effects run. Restart re-arms them only after `EffectsEnabled`; an additive migration
   may backfill a missing versioned record but must not replace an existing one. — INDEX concern #46

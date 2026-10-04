@@ -640,7 +640,12 @@ impl CiphernodeBuilder {
         Ok((AggregateConfig::new(delays), chain_ids))
     }
 
-    pub async fn build(mut self) -> anyhow::Result<CiphernodeHandle> {
+    pub async fn build(self) -> anyhow::Result<CiphernodeHandle> {
+        // Keep the startup state out of the caller's future.
+        Box::pin(self.build_inner()).await
+    }
+
+    async fn build_inner(mut self) -> anyhow::Result<CiphernodeHandle> {
         self.ensure_role_components()?;
         ensure!(
             self.multithread_concurrent_jobs != Some(0),
@@ -819,21 +824,22 @@ impl CiphernodeBuilder {
             self.fetch_chain_configuration(&mut provider_cache).await?;
 
         // Setup protocol extensions (keyshare, aggregation, ZK, accusation, commitment)
-        let e3_builder = self
-            .setup_extensions(
-                &bus,
-                store.clone(),
-                &mut provider_cache,
-                &sortition,
-                &addr,
-                &dkg_fold_context_by_chain,
-                &dkg_fold_contexts_by_e3,
-                &accusation_vote_validity_by_chain,
-                &slashing_managers,
-                &selector_state,
-                &lifecycle_stages,
-            )
-            .await?;
+        // Keep the startup future within the default thread stack.
+        let e3_builder = Box::pin(self.setup_extensions(
+            &bus,
+            store.clone(),
+            &mut provider_cache,
+            &sortition,
+            &addr,
+            &dkg_fold_context_by_chain,
+            &dkg_fold_contexts_by_e3,
+            &accusation_vote_validity_by_chain,
+            &slashing_managers,
+            &selector_state,
+            &lifecycle_stages,
+            &event_system,
+        ))
+        .await?;
 
         // Arm the one-shot before the network can publish the no-peer fast-path signal.
         let net_ready = bus.wait_for(EventType::NetReady);
@@ -1136,6 +1142,7 @@ impl CiphernodeBuilder {
         slashing_managers: &[Option<Address>],
         selector_state: &CiphernodeSelectorState,
         lifecycle_stages: &HashMap<E3id, E3Stage>,
+        event_system: &EventSystem,
     ) -> Result<e3_request::E3RouterBuilder> {
         let recovered_selections = recovered_ciphernode_selections(selector_state, addr)?;
         // A slashably-failed context also outlives the longest accusation vote.
@@ -1166,9 +1173,20 @@ impl CiphernodeBuilder {
             persisted_e3_metadata,
             dkg_fold_contexts_by_e3.clone(),
         );
-        zk_recovery
-            .hydrate_node_proofs(&repositories, lifecycle_stages)
-            .await?;
+        Box::pin(
+            zk_recovery.hydrate(
+                &repositories,
+                lifecycle_stages,
+                &event_system.eventstore_reader()?.seq(),
+                &event_system
+                    .aggregate_config()
+                    .indexed_ids()
+                    .into_iter()
+                    .map(AggregateId::new)
+                    .collect::<Vec<_>>(),
+            ),
+        )
+        .await?;
 
         // ── Threshold keyshare + ZK actors ──
         if let Some(KeyshareKind::Threshold) = self.keyshare {
@@ -2186,8 +2204,10 @@ mod tests {
             // The old decoder could persist an empty chain projection. Keep its bytes intact.
             let legacy_store =
                 e3_data::Repository::new(repos.store.scope("//sortition/admission/v1"));
-            let mut legacy = AdmissionState::default();
-            legacy.schema_version = 1;
+            let mut legacy = AdmissionState {
+                schema_version: 1,
+                ..Default::default()
+            };
             legacy.chains.entry(1).or_default();
             legacy_store.write_sync(&legacy).await?;
             let legacy_bytes = bincode::serialize(&legacy)?;
