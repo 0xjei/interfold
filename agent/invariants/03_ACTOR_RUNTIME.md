@@ -41,9 +41,12 @@ the code does not meet yet.
 - Trust-boundary checks before any message drives a workflow: peer identity, committee membership,
   claimed party slot, signature, chainId, e3Id, proof type, payload size, schema version. **Gap:**
   the code runs these checks in two stages. Net ingress checks the wire envelope (magic, wire
-  version, size, network ID) before a workflow sees the message. Share verification checks the
-  signer, party slot, e3Id, and circuit later, before a party counts as honest. Most message types
-  lack an explicit schema version. — `ARCHITECTURE.md`; `crates/net/src/network_sync/wire.rs`;
+  version, size, network ID) before a workflow sees the message. DKG share and C4 intake verify the
+  finalized dealer's signature over the complete message before saving or collecting it. Rejected
+  messages leave the dealer slot free. C0 intake checks the signed proof and its key commitment
+  before pending verification. Share verification checks proof signatures, party slots, E3 IDs, and
+  circuits before a party counts as honest. Most message types lack an explicit schema version. —
+  `ARCHITECTURE.md`; `crates/net/src/network_sync/wire.rs`;
   `crates/zk-prover/src/share_verification/`
 
 ### Durability, persistence, replay
@@ -68,9 +71,9 @@ the code does not meet yet.
 - A data directory belongs to one node role. All readers of a chain share one block cursor, so a
   node with fewer readers advances it past events that a node with more readers still needs.
   `preflight_node_role` stamps the role on first boot and refuses a directory of the other role; an
-  unmarked directory that existed before this startup is a full node's. **Gap:** releases before the
-  marker share schema version 7 and do not check it. — `crates/sync/src/sync/node_role.rs`;
-  `crates/sync/src/sync/preflight.rs`
+  unmarked directory that existed before this startup is a full node's. The storage schema guard
+  rejects schema 7 directories from releases without this marker. —
+  `crates/sync/src/sync/node_role.rs`; `crates/sync/src/sync/preflight.rs`
 - Before startup enables the event bus, its HLC must be greater than the greatest timestamp in all
   durable event logs. A snapshot timestamp alone is not a sufficient clock floor because the log can
   contain a newer post-snapshot suffix. — INDEX concern #56
@@ -158,8 +161,11 @@ the code does not meet yet.
 - On restart in `ReadyForDecryption`, rebuild the C4 collector from the saved roster and replay
   saved peer C4 shares. A restored C4 proof job cannot advance DKG if its peer-share collector is
   absent. After collection is complete, a duplicate C4 share must not start another collector. Saved
-  C0 and C4 inputs must keep the first message from each party, as the live collectors do. —
-  `flow-trace/04`
+  C0 and C4 inputs must keep the first authenticated message from each party, as the live collectors
+  do. A C2/C3 batch with no proof that passes local prechecks still dispatches and saves its
+  outcome. A later authenticated share can grow that batch, including after hydration. Each new
+  threshold-share collector receives saved expulsions, then all retained authenticated shares. Key
+  calculation completion and actor shutdown stop that collector and its timers. — `flow-trace/04`
 - `CommitmentConsistencyChecker` persists its complete verified-proof cache and accepted DKG roster
   in the same snapshot batch as each event that changes them. Hydration restores this state before
   recovered proof work resumes. A restarted checker must not evaluate C2, C3, C4, or aggregate
@@ -339,5 +345,9 @@ the code does not meet yet.
   Roots that no lock lists, store keys, hand-written formats, and values stored inside opaque bytes
   are not covered. Until that changes, increase `SCHEMA_VERSION`
   (`crates/sync/src/sync/schema_version.rs`) for every incompatible change to a persisted type or
-  `InterfoldEventData` variant, including an added field. Startup halts on any mismatch. —
+  `InterfoldEventData` variant, including an added field. Startup and event readers check the marker
+  through the raw key/value store before opening, repairing, or decoding logs and derived state.
+  `node validate` uses the same check before all event and snapshot checks, including with
+  `--repair`. A mismatch names the supported recovery action and leaves log bytes unchanged. —
+  `crates/sync/src/sync/preflight.rs`; `crates/entrypoint/tests/validate_older_schema.rs`;
   `ARCHITECTURE.md`; `00_INDEX.md` known open issues
