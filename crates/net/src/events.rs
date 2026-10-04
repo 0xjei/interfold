@@ -354,6 +354,13 @@ impl NetCommand {
 pub enum NetEvent {
     /// Bytes have been broadcast over the network
     GossipData(GossipData),
+    /// A protocol event with transient propagation-peer attribution.
+    GossipIngress {
+        propagation_source: PeerId,
+        data: GossipData,
+    },
+    /// A document notification with local transport attribution.
+    DocumentIngress(Box<DocumentIngress>),
     /// There was an Error publishing bytes over the network
     GossipPublishError {
         correlation_id: CorrelationId,
@@ -453,6 +460,8 @@ impl NetEvent {
         // Keep this match exhaustive. Each new event must select one delivery path.
         match self {
             Self::GossipData(_)
+            | Self::GossipIngress { .. }
+            | Self::DocumentIngress(_)
             | Self::GossipPublishError { .. }
             | Self::GossipPublished { .. }
             | Self::DhtGetRecordSucceeded { .. }
@@ -481,7 +490,9 @@ impl NetEvent {
     /// event-count limit.
     pub(crate) fn buffered_size_bytes(&self) -> usize {
         let dynamic = match self {
-            Self::GossipData(data) => serialized_size(data),
+            Self::GossipData(data) | Self::GossipIngress { data, .. } => serialized_size(data),
+            Self::DocumentIngress(ingress) => std::mem::size_of::<DocumentIngress>()
+                .saturating_add(serialized_size(&ingress.notification)),
             Self::GossipPublished { message_id, .. } => message_id.0.len(),
             Self::DhtGetRecordSucceeded { value, .. } => value.len(),
             Self::DhtGetRecordError { error, .. } => match error {
@@ -546,6 +557,14 @@ fn serialized_size(value: &impl Serialize) -> usize {
         .ok()
         .and_then(|size| usize::try_from(size).ok())
         .unwrap_or(usize::MAX)
+}
+
+/// Transient ingress metadata. In-process notifications share one unattributed queue.
+#[derive(Message, Clone, Debug)]
+#[rtype(result = "()")]
+pub struct DocumentIngress {
+    pub propagation_source: Option<PeerId>,
+    pub notification: DocumentPublishedNotification,
 }
 
 /// Payload that is dispatched as a net -> net gossip event from Kademlia. This event signals that

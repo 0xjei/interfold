@@ -248,13 +248,24 @@ impl Handler<ReplicateDocument> for DocumentPublisher {
 impl Handler<DocumentPublishedNotification> for DocumentPublisher {
     type Result = ();
     fn handle(&mut self, msg: DocumentPublishedNotification, ctx: &mut Self::Context) {
-        if !notification_is_well_formed(&msg) {
-            debug!("Ignored a malformed document notification");
-            return;
-        }
-        // An expired notification cannot lead to the document. This also drops the early
-        // notifications that expired while the node waited for selection.
-        if msg.meta.expires_at <= chrono::Utc::now() {
+        self.handle(
+            DocumentIngress {
+                propagation_source: None,
+                notification: msg,
+            },
+            ctx,
+        );
+    }
+}
+
+impl Handler<DocumentIngress> for DocumentPublisher {
+    type Result = ();
+    fn handle(&mut self, ingress: DocumentIngress, ctx: &mut Self::Context) {
+        let peer = ingress.propagation_source;
+        let msg = ingress.notification;
+        let now = chrono::Utc::now();
+        if !notification_is_valid(&msg, now) {
+            debug!("Ignored an invalid or expired document notification");
             return;
         }
         let id = (msg.meta.e3_id.clone(), msg.key.clone());
@@ -263,22 +274,46 @@ impl Handler<DocumentPublishedNotification> for DocumentPublisher {
         }
         let ids = self.service.interest_snapshot();
         if !ids.contains_key(&msg.meta.e3_id) {
-            // Keep one notification per document and party filter, with the latest expiry. Only
+            self.early_notifications
+                .retain(|item| item.notification.meta.expires_at > now);
+            // Keep one notification per peer, document and party filter, with the latest expiry. Only
             // the filter decides whether a notification can match the payload, so a forged copy
             // that arrives first must not hide a correct one with another filter or outlive it.
             if let Some(item) = self.early_notifications.iter_mut().find(|item| {
-                item.meta.e3_id == msg.meta.e3_id
-                    && item.key == msg.key
-                    && item.meta.filter == msg.meta.filter
+                item.notification.meta.e3_id == msg.meta.e3_id
+                    && item.notification.key == msg.key
+                    && item.notification.meta.filter == msg.meta.filter
+                    && item.propagation_source == peer
             }) {
-                if msg.meta.expires_at > item.meta.expires_at {
-                    *item = msg;
+                if msg.meta.expires_at > item.notification.meta.expires_at {
+                    item.notification = msg;
                 }
             } else {
-                if self.early_notifications.len() == MAX_BUFFERED_NOTIFICATIONS {
-                    self.early_notifications.pop_front();
+                if self.early_notifications.len() >= MAX_BUFFERED_NOTIFICATIONS {
+                    let mut counts = HashMap::new();
+                    for item in &self.early_notifications {
+                        *counts.entry(item.propagation_source).or_insert(0usize) += 1;
+                    }
+                    let owner = crate::ingress_limits::eviction_owner(
+                        peer,
+                        counts.into_iter(),
+                        MAX_BUFFERED_NOTIFICATIONS,
+                    );
+                    if owner == peer {
+                        return;
+                    }
+                    if let Some(index) = self
+                        .early_notifications
+                        .iter()
+                        .position(|item| item.propagation_source == owner)
+                    {
+                        self.early_notifications.remove(index);
+                    }
                 }
-                self.early_notifications.push_back(msg);
+                self.early_notifications.push_back(DocumentIngress {
+                    propagation_source: peer,
+                    notification: msg,
+                });
             }
             return;
         }
@@ -287,8 +322,8 @@ impl Handler<DocumentPublishedNotification> for DocumentPublisher {
         {
             return;
         }
-        if self.fetching.contains_key(&id) {
-            add_candidate(self.late_notifications.entry(id).or_default(), msg);
+        if let Some(fetching) = self.fetching.get_mut(&id) {
+            fetching.add(peer, msg);
             return;
         }
         if self.received.len() >= MAX_RECEIVED_DOCUMENTS {
@@ -298,7 +333,7 @@ impl Handler<DocumentPublishedNotification> for DocumentPublisher {
             );
             return;
         }
-        if !self.fetch_queue.push(id, msg, Instant::now()) {
+        if !self.fetch_queue.push(id, peer, msg, Instant::now()) {
             debug!("Dropped a document notification because the fetch queue is full");
             return;
         }
@@ -331,46 +366,48 @@ impl DocumentPublisher {
     fn start_due_fetches(&mut self, ctx: &mut actix::Context<Self>) {
         let now = Instant::now();
         while self.fetching.len() < MAX_INFLIGHT_TRANSFERS {
-            let Some((id, waiting)) = self.fetch_queue.pop_due(now) else {
+            let mut in_flight = HashMap::new();
+            for fetching in self.fetching.values() {
+                *in_flight.entry(fetching.peer).or_insert(0) += 1;
+            }
+            let Some((id, waiting)) = self.fetch_queue.pop_due(now, &in_flight) else {
                 break;
             };
             if self.closed_e3s.contains(&id.0) || self.received.contains(&id) {
                 continue;
             }
-            self.start_fetch(id, waiting.notifications, waiting.failures, ctx);
+            self.start_fetch(id, waiting, ctx);
         }
     }
 
     fn start_fetch(
         &mut self,
         id: DocumentId,
-        notifications: Vec<DocumentPublishedNotification>,
-        failures: u32,
+        waiting: WaitingFetch,
         ctx: &mut actix::Context<Self>,
     ) {
         let ids = self.service.interest_snapshot();
         let tx = self.tx.clone();
         let rx = self.rx.clone();
         let (abort, registration) = AbortHandle::new_pair();
-        self.fetching.insert(id.clone(), failures);
+        let notifications = waiting.notifications.clone();
+        self.fetching.insert(id.clone(), waiting);
         self.fetch_aborts.insert(id.clone(), abort);
         ctx.spawn(
             Abortable::new(
-                handle_document_published_notification(tx, rx, ids, notifications.clone()),
+                handle_document_published_notification(tx, rx, ids, notifications),
                 registration,
             )
             .into_actor(self)
             .map(move |result, actor, ctx| {
-                actor.fetching.remove(&id);
                 actor.fetch_aborts.remove(&id);
+                let Some(mut waiting) = actor.fetching.remove(&id) else {
+                    return;
+                };
                 let now = chrono::Utc::now();
-                let late: Vec<_> = actor
-                    .late_notifications
-                    .remove(&id)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|notification| notification.meta.expires_at > now)
-                    .collect();
+                waiting
+                    .notifications
+                    .retain(|notification| notification.meta.expires_at > now);
                 match result {
                     Ok(Ok(Some((document, notification)))) => {
                         actor.accept_document(id, document, notification);
@@ -388,7 +425,7 @@ impl DocumentPublisher {
                             Some(value) => {
                                 let ids = actor.service.interest_snapshot();
                                 if let Ok(Some((document, notification))) =
-                                    bind_to_candidate(&ids, late, value)
+                                    bind_to_candidate(&ids, waiting.notifications, value)
                                 {
                                     actor.accept_document(id, document, notification);
                                 } else {
@@ -398,18 +435,8 @@ impl DocumentPublisher {
                                 }
                             }
                             None => {
-                                let mut candidates = notifications;
-                                for notification in late {
-                                    add_candidate(&mut candidates, notification);
-                                }
-                                candidates
-                                    .retain(|notification| notification.meta.expires_at > now);
-                                if !actor.fetch_queue.retry(
-                                    id,
-                                    candidates,
-                                    failures + 1,
-                                    Instant::now(),
-                                ) {
+                                waiting.failures = waiting.failures.saturating_add(1);
+                                if !actor.fetch_queue.retry(id, waiting, Instant::now()) {
                                     debug!(
                                         "Stopped fetching a document until it is announced again"
                                     );

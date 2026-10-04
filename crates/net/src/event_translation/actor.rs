@@ -57,7 +57,7 @@ impl Actor for NetEventTranslator {
 /// Libp2pEvent is used to send data to the Libp2pNetInterface from the NetEventTranslator
 #[derive(Message, Clone, Debug, PartialEq, Eq)]
 #[rtype(result = "()")]
-struct LibP2pEvent(pub GossipData);
+struct LibP2pEvent(pub GossipData, pub Option<libp2p::PeerId>);
 
 impl NetEventTranslator {
     /// Create a new NetEventTranslator actor
@@ -96,10 +96,15 @@ impl NetEventTranslator {
                 while let Some(event) =
                     crate::event_subscription::recv_net_event(&mut rx, "NetEventTranslator").await
                 {
-                    let NetEvent::GossipData(data @ GossipData::GossipBytes(_)) = event else {
-                        continue;
+                    let (data, peer) = match event {
+                        NetEvent::GossipIngress {
+                            propagation_source,
+                            data: data @ GossipData::GossipBytes(_),
+                        } => (data, Some(propagation_source)),
+                        NetEvent::GossipData(data @ GossipData::GossipBytes(_)) => (data, None),
+                        _ => continue,
                     };
-                    if let Err(error) = addr.send(LibP2pEvent(data)).await {
+                    if let Err(error) = addr.send(LibP2pEvent(data, peer)).await {
                         warn!(%error, "NetEventTranslator stopped; ending gossip ingress");
                         break;
                     }
@@ -217,12 +222,16 @@ impl NetEventTranslator {
         // The peer supplies the context ID; the event store derives the ID from the payload.
         let id = EventId::hash(&data);
         let now = Instant::now();
-        if self.service.is_stored_remote_event(&id, now) {
+        if !self.service.admit_remote_event(msg.1, &id, now) {
             return Ok(());
         }
-        self.bus
-            .publish_from_remote(data, ec.ts(), None, EventSource::Net)?;
-        self.service.record_remote_event(id, now);
+        if let Err(error) = self
+            .bus
+            .publish_from_remote(data, ec.ts(), None, EventSource::Net)
+        {
+            self.service.reject_remote_event(&id);
+            return Err(error);
+        }
         Ok(())
     }
 }
@@ -301,6 +310,137 @@ mod tests {
             EventSource::Local,
         );
         event.into_sequenced(1)
+    }
+
+    #[actix::test]
+    async fn busy_peers_do_not_discard_other_peers_events() -> Result<()> {
+        use e3_events::{AggregateConfig, AggregateId, EventBus, EventBusConfig, GetEvents};
+        let system = EventSystem::new()
+            .with_event_bus(EventBus::new(EventBusConfig { deduplicate: false }).start())
+            .with_aggregate_config(AggregateConfig::new(HashMap::from([(
+                AggregateId::new(1),
+                Duration::ZERO,
+            )])));
+        let bus = system.handle()?.enable("test");
+        let history = bus.history();
+        let (tx, _commands) = mpsc::channel(8);
+        let events = NetEventChannel::new(2048);
+        let _translator = NetEventTranslator::setup(
+            &bus,
+            &tx,
+            &NetEventSubscriber::from(&events),
+            "topic",
+            NetworkPolicy::local_unrestricted(),
+        );
+        let peers = [
+            libp2p::PeerId::random(),
+            libp2p::PeerId::random(),
+            libp2p::PeerId::random(),
+        ];
+        let mut expected = std::collections::HashSet::new();
+        for round in 0..40 {
+            for (source, count) in [(0, 8), (1, 8), (2, 1)] {
+                for index in 0..count {
+                    let event = bus.event_from(
+                        KeyshareCreated {
+                            e3_id: E3id::new(round.to_string(), 1),
+                            pubkey: ArcBytes::from_bytes(b"key"),
+                            node: format!("node-{source}"),
+                            party_id: index,
+                            signed_pk_generation_proof: None,
+                        },
+                        None,
+                    )?;
+                    expected.insert(event.event_id());
+                    let data = GossipData::GossipBytes(event.to_bytes()?);
+                    for _ in 0..2 {
+                        events.send(NetEvent::GossipIngress {
+                            propagation_source: peers[source],
+                            data: data.clone(),
+                        })?;
+                        tokio::task::yield_now().await;
+                    }
+                }
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let stored = history.send(GetEvents::<InterfoldEvent>::new()).await?;
+                let actual: Vec<_> = stored
+                    .iter()
+                    .filter(|event| event.source() == EventSource::Net)
+                    .map(|event| event.event_id())
+                    .collect();
+                if actual.len() >= expected.len() {
+                    assert_eq!(
+                        actual.len(),
+                        expected.len(),
+                        "each logical contribution is stored once"
+                    );
+                    assert_eq!(
+                        actual.into_iter().collect::<std::collections::HashSet<_>>(),
+                        expected
+                    );
+                    return anyhow::Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await??;
+        Ok(())
+    }
+
+    #[actix::test]
+    async fn rejected_timestamp_does_not_mark_an_event_as_stored() -> Result<()> {
+        use e3_events::{AggregateConfig, AggregateId, GetEvents};
+        let system =
+            EventSystem::new()
+                .with_fresh_bus()
+                .with_aggregate_config(AggregateConfig::new(HashMap::from([(
+                    AggregateId::new(1),
+                    Duration::ZERO,
+                )])));
+        let bus = system.handle()?.enable("test");
+        let history = bus.history();
+        let (tx, _commands) = mpsc::channel(8);
+        let events = NetEventChannel::new(8);
+        let mut translator = NetEventTranslator::new(
+            &bus,
+            &tx,
+            &NetEventSubscriber::from(&events),
+            "topic",
+            NetworkPolicy::local_unrestricted(),
+        );
+        let data = local_forwardable_event().get_data().clone();
+        let rejected: InterfoldEvent<Unsequenced> = InterfoldEvent::new_with_timestamp(
+            data.clone(),
+            None,
+            u128::MAX,
+            None,
+            EventSource::Net,
+        );
+        assert!(translator
+            .handle_remote_event(LibP2pEvent(
+                GossipData::GossipBytes(rejected.to_bytes()?),
+                None
+            ))
+            .is_err());
+        let accepted = bus.event_from(data.clone(), None)?;
+        translator.handle_remote_event(LibP2pEvent(
+            GossipData::GossipBytes(accepted.to_bytes()?),
+            None,
+        ))?;
+        bus.flush_event_pipeline().await?;
+        let stored = history.send(GetEvents::<InterfoldEvent>::new()).await?;
+        assert_eq!(
+            stored
+                .iter()
+                .filter(|event| event.get_data() == &data)
+                .count(),
+            1,
+            "a rejected timestamp must not suppress a later valid delivery"
+        );
+        Ok(())
     }
 
     /// The network reports the result of a publication once, on a bounded broadcast channel. A
