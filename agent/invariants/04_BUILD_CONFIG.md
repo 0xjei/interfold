@@ -33,8 +33,24 @@ every section.
   `SOURCE_HASH` matches the current source tree. A different build at the branch tip must not
   replace it. The release workflow archives the branch tip and fails if the tip's hash differs.
   Release verification still checks the source hash, every required pair, and each pair's build
-  stamp. `SOURCE_HASH` includes the shared Noir library and its dependency manifest (see
-  `02_CRYPTO_CIRCUITS.md` §Noir / Barretenberg compatibility).
+  stamp. `crates/zk-prover/supported-configurations.json` owns the release matrix that archive
+  installation and release verification require. Each listed pair must be a build pair in
+  `scripts/circuit-constants.ts`, and a tooling test checks this. The matrix file is not a
+  `SOURCE_HASH` input. CI download fixtures explicitly request the two `minimum` pairs. CI local
+  archive setup selects `insecure-512/minimum` with `--circuits-configuration`. `SOURCE_HASH`
+  includes the shared Noir library and its dependency manifest (see `02_CRYPTO_CIRCUITS.md` §Noir /
+  Barretenberg compatibility).
+- Network circuit installation requires a version-bound archive SHA-256 compiled into the binary.
+  `download-circuits` in `.github/workflows/releases.yml` hashes the exact archive that it uploads.
+  Binary and ciphernode image builds depend on that job and pass `E3_CIRCUITS_ARCHIVE_SHA256` to
+  `crates/zk-prover/build.rs`, including through the Docker build argument. `ZkConfig::default`
+  binds this pin to `CARGO_PKG_VERSION` and retains the other pins from `versions.json`. Builds
+  without this input work, but downloads for unpinned versions fail before network access. Each
+  binary build checks the pin reported by `noir status` before the release-candidate gate can pass.
+  The ciphernode Docker build checks the same report. The support image compiles no CLI or
+  ciphernode, and DAppNode copies the checked ciphernode image. CI generates a manifest for exactly
+  the staged fixture before packaging and hashing it. — `02_CRYPTO_CIRCUITS.md` §Noir / Barretenberg
+  compatibility
 - **`Elf.sol` is never committed.** `crates/support/methods/build.rs` writes it with a machine-local
   guest ELF path, so it is generated per checkout and `.gitignore`d.
 - **A release publishes a complete provenance manifest** — `pnpm provenance:manifest`. It ties

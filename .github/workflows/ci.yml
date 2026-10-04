@@ -566,6 +566,7 @@ jobs:
         run: |
           test -f .ci-noir/circuits/insecure-512/minimum/default/dkg/pk/pk.json
           test -f .ci-noir/circuits/secure-8192/minimum/default/dkg/pk/pk.json
+          pnpm tsx scripts/circuit-artifacts.ts checksums --dir .ci-noir/circuits
           mkdir -p "$RUNNER_TEMP/circuit-release"
           tar -czf "$RUNNER_TEMP/circuit-release/circuits-candidate.tar.gz" \
             -C .ci-noir circuits
@@ -580,6 +581,7 @@ jobs:
         env:
           E3_TEST_CIRCUITS_DOWNLOAD_URL: http://127.0.0.1:8123/circuits-candidate.tar.gz
         run: |
+          export E3_TEST_CIRCUITS_SHA256=$(sha256sum "$RUNNER_TEMP/circuit-release/circuits-candidate.tar.gz" | cut -d ' ' -f1)
           python3 -m http.server 8123 --bind 127.0.0.1 --directory "$RUNNER_TEMP/circuit-release" >"$RUNNER_TEMP/circuit-server.log" 2>&1 &
           SERVER_PID=$!
           trap 'kill "$SERVER_PID"' EXIT
@@ -1257,7 +1259,8 @@ jobs:
         working-directory: ./examples/CRISP
         run: |
           tar -C "$GITHUB_WORKSPACE/dist" -czf "$RUNNER_TEMP/circuits-candidate.tar.gz" circuits/
-          interfold noir setup --circuits-archive "$RUNNER_TEMP/circuits-candidate.tar.gz"
+          interfold noir setup --circuits-archive "$RUNNER_TEMP/circuits-candidate.tar.gz" \
+            --circuits-configuration insecure-512/minimum
           interfold noir setup
 
       - name: Run Playwright tests
@@ -1819,7 +1822,8 @@ jobs:
         working-directory: ./templates/default
         run: |
           tar -C "$GITHUB_WORKSPACE/dist" -czf "$RUNNER_TEMP/circuits-candidate.tar.gz" circuits/
-          interfold noir setup --circuits-archive "$RUNNER_TEMP/circuits-candidate.tar.gz"
+          interfold noir setup --circuits-archive "$RUNNER_TEMP/circuits-candidate.tar.gz" \
+            --circuits-configuration insecure-512/minimum
           interfold noir setup
 
       - name: Verify downloaded artifacts
