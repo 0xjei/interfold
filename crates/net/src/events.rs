@@ -129,7 +129,13 @@ impl TryFrom<GossipData> for InterfoldEvent<Unsequenced> {
 #[derive(Derivative, Clone, serde::Serialize, serde::Deserialize)]
 #[derivative(Debug)]
 pub enum ProtocolResponse {
-    Ok(#[derivative(Debug(format_with = "e3_utils::formatters::hexf"))] Vec<u8>),
+    /// The transport encodes the bytes as one CBOR byte string, so a reply's frame is its bytes
+    /// plus a few header bytes. As a CBOR integer array, a byte above 23 would take two.
+    Ok(
+        #[derivative(Debug(format_with = "e3_utils::formatters::hexf"))]
+        #[serde(with = "serde_bytes")]
+        Vec<u8>,
+    ),
     BadRequest(String),
     Error(String),
 }
@@ -674,6 +680,30 @@ pub fn estimate_hashmap_size<K, V>(map: &HashMap<K, V>) -> usize {
     capacity * (entry_size + 1) + size_of::<HashMap<K, V>>()
 }
 
+/// Send `payload` through the transport frame of a direct reply, and return the bytes that the
+/// reader decodes. Fails when the frame exceeds the 10 MiB response limit.
+#[cfg(test)]
+pub(crate) async fn through_reply_frame(payload: Vec<u8>) -> anyhow::Result<Vec<u8>> {
+    use futures::io::Cursor;
+    use libp2p::request_response::{cbor::codec::Codec, Codec as _};
+
+    let protocol = libp2p::StreamProtocol::new("/interfold/test-sync");
+    let mut codec = Codec::<Vec<u8>, ProtocolResponse>::default();
+    let mut frame = Cursor::new(Vec::new());
+    codec
+        .write_response(&protocol, &mut frame, ProtocolResponse::Ok(payload))
+        .await?;
+    anyhow::ensure!(
+        frame.get_ref().len() <= crate::domain::wire::MAX_DIRECT_MESSAGE_BYTES,
+        "the reply frame exceeds the response limit"
+    );
+    let mut reader = Cursor::new(frame.into_inner());
+    match codec.read_response(&protocol, &mut reader).await? {
+        ProtocolResponse::Ok(bytes) => Ok(bytes),
+        _ => anyhow::bail!("the reply decoded to another response"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use e3_events::{
@@ -688,6 +718,19 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::{call_and_await_response, GossipData, NetCommand, NetEvent, ProtocolResponse};
+
+    /// A reply of the largest sync envelope, with bytes that a CBOR integer array would double,
+    /// fits one transport frame and decodes to the same bytes.
+    #[tokio::test]
+    async fn a_largest_sync_reply_fits_one_transport_frame() {
+        let payload: Vec<u8> = (0..crate::domain::wire::MAX_SYNC_ENVELOPE_BYTES)
+            .map(|index| 24 + (index % 232) as u8)
+            .collect();
+        let decoded = super::through_reply_frame(payload.clone())
+            .await
+            .expect("the reply fits one frame");
+        assert!(decoded == payload);
+    }
     use crate::{
         net_interface_handle::{NetEventChannel, NetEventSubscriber},
         ContentHash,
