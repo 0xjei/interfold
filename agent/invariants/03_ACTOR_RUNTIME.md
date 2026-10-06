@@ -134,23 +134,31 @@ the code does not meet yet.
   node does not read that chain, so its contexts resume unchecked. If the E3 exists at chain head
   but not yet at the finalized block, recovery keeps the context and waits; finality lag is not an
   unknown E3. Before the restart backfill, startup reads `getE3Stage` and `getFailureReason` at the
-  finalized block for each request-router checkpoint context whose local lifecycle stage is not
-  terminal. It reads 16 contexts per batch. The connection to the chain and each batch have a 60 s
-  bound, and a batch is read again twice after an RPC error. It writes the canonical stage of a
-  finished E3 to the lifecycle store, so every restart decision that reads the lifecycle treats that
-  E3 as terminal. The router does not forward `EffectsEnabled` to a restored context whose lifecycle
-  stage is terminal and publishes `E3RequestComplete` for it; startup pruned its finalized
-  committee. The data-availability coordinator of each chain drops the restored key assembly and
-  ciphertext retrieval of such an E3 before `EffectsEnabled`, and ignores later facts for it. A
-  disabled chain covers the contexts of its configured `chain_id`; a context of a chain that the
-  configuration does not have fails startup. **Gap:** a context whose local lifecycle stage is
-  Failed completes at `EffectsEnabled` even when its failure reason needs accusation work, because
-  the lifecycle does not keep the reason. A context whose E3 failed on chain with a slashing reason,
-  but not in the local lifecycle, resumes its work at `EffectsEnabled`. A context that the
-  EventStore suffix after the checkpoint admits during replay is not checked. All three are
-  follow-up work. Document publication recovery does not read the lifecycle. —
-  `crates/ciphernode-builder/src/finalized_lifecycle.rs`; `crates/evm/src/finalized_lifecycle.rs`;
-  INDEX concern #48
+  finalized block for each context that the router holds when startup replay ends, whose local
+  lifecycle stage is not terminal: the checkpoint's contexts, with the admissions and completions of
+  the logged events after the checkpoint applied. It reads 16 contexts per batch. The connection to
+  the chain and each batch have a 60 s bound, and a batch is read again twice after an RPC error. It
+  writes the canonical stage of a finished E3 to the lifecycle store, so every restart decision that
+  reads the lifecycle treats that E3 as terminal. The router does not forward `EffectsEnabled` to a
+  restored context whose lifecycle stage is terminal and publishes `E3RequestComplete` for it;
+  startup pruned its finalized committee. The data-availability coordinator of each chain drops the
+  restored key assembly and ciphertext retrieval of such an E3 before `EffectsEnabled`, and ignores
+  later facts for it. Any other E3 that failed at the finalized block keeps its context for
+  accusation or slashing work, but its other work ends: the router forwards a Failed
+  `E3StageChanged` to the context when the router is built, before replay, or at `EffectsEnabled`
+  for a context that replay admits, so its keyshare and its public-key and plaintext aggregators
+  stop, also a plaintext aggregation that still waits for the key's chain authority, and a recipient
+  that the context creates later gets it first; a selection of the E3, recovered, replayed or live,
+  starts no protocol actor; the compute gate and ZK recovery start with the Failed stage for it, so
+  the C0 verifier admits none of its inputs, recovered, replayed or live, and the gate still admits
+  accusation re-verification; and the data-availability coordinator drops its restored work. The
+  Failed event has the E3's aggregate and the router's cursor of it, so the actors' cleanup writes
+  are not stale. A disabled chain covers the contexts of its configured `chain_id`; a context of a
+  chain that the configuration does not have fails startup. **Gap:** a context whose local lifecycle
+  stage is Failed completes at `EffectsEnabled` even when its failure reason needs accusation work,
+  because the lifecycle does not keep the reason. This is follow-up work. Document publication
+  recovery does not read the lifecycle. — `crates/ciphernode-builder/src/finalized_lifecycle.rs`;
+  `crates/evm/src/finalized_lifecycle.rs`; INDEX concern #48
 - EventStore replay preserves durable sequence inside each aggregate. It uses HLC order only to
   choose between the next events of different aggregates. A late event can have an older remote HLC
   and must not move ahead of an earlier local sequence from the same aggregate. — INDEX concern #43
@@ -269,8 +277,10 @@ the code does not meet yet.
   `crates/keyshare/src/threshold_keyshare/effects/create_decryption_share.rs`; `flow-trace/04`
 - A terminal E3 cancels its local node-scoped compute-task group. Work already executing may finish,
   but queued proof jobs from that E3 must not consume task-pool capacity ahead of a later active E3.
-  One node's local failure must not cancel another node's work when tests or embeddings share a task
-  pool. — `flow-trace/04`
+  Accusation re-verification runs in its own group: a failure does not cancel it, so a node can
+  still vote on an accusation of a failed E3; the end of the request cancels it. One node's local
+  failure must not cancel another node's work when tests or embeddings share a task pool. —
+  `flow-trace/04`
 - A local prover, verifier, task-pool, or resource failure is not evidence of peer misbehavior.
   Retry the exact ZK request, preserve its durable input, and let canonical E3 lifecycle facts end
   recovery. Only a completed cryptographic check can classify a peer proof as invalid. —
@@ -280,7 +290,8 @@ the code does not meet yet.
   other sequence gaps. An empty filtered page is not end-of-log until the physical cursor passes the
   log head. Recovery advances one physical record at a time across empty pages, including pages
   limited by decoded bytes. Later C0 inputs remain recoverable. It applies the live admission checks
-  and excludes E3s past DKG. Recovered and replayed C0 inputs dispatch only after `EffectsEnabled`;
+  and excludes E3s past DKG, and the verifier refuses a replayed or later input of an E3 whose DKG
+  ended before startup. Recovered and replayed C0 inputs dispatch only after `EffectsEnabled`;
   document deduplication cannot erase unresolved verification work. Local failures retry with a
   delay that doubles from 5 to 60 seconds. `E3RequestComplete` cancels the retries. —
   `crates/zk-prover/src/proof_verification/recovery.rs`; `flow-trace/06`

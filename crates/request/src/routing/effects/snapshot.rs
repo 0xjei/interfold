@@ -110,6 +110,8 @@ impl FromSnapshotWithParams for E3Router {
             recovered_selections: params.recovered_selections,
             teardown_grace: params.teardown_grace,
             complete_on_restart: params.complete_on_restart,
+            fail_on_restart: params.fail_on_restart,
+            failures_delivered: HashSet::new(),
         })
     }
 }

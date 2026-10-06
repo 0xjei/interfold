@@ -27,7 +27,9 @@ use e3_events::BusHandle;
 use e3_events::E3RequestComplete;
 use e3_events::EType;
 use e3_events::EventType;
-use e3_events::{AggregateId, CiphernodeSelected, E3id, InterfoldEvent, RequestRouterCheckpoint};
+use e3_events::{
+    AggregateId, CiphernodeSelected, E3Stage, E3id, InterfoldEvent, RequestRouterCheckpoint,
+};
 use e3_utils::MAILBOX_LIMIT;
 use serde::Deserialize;
 use serde::Serialize;
@@ -110,6 +112,12 @@ pub struct E3Router {
     teardown_grace: Duration,
     /// Finished E3s whose restored contexts complete at `EffectsEnabled` without resuming.
     complete_on_restart: HashSet<E3id>,
+    /// E3s that failed on chain with accusation or slashing work, with their local lifecycle stage.
+    /// At `EffectsEnabled` their restored contexts learn of the failure before effects resume, and
+    /// their recovered selections start no protocol actor.
+    fail_on_restart: HashMap<E3id, E3Stage>,
+    /// Kept failures whose contexts already learned of the failure.
+    failures_delivered: HashSet<E3id>,
 }
 
 pub struct E3RouterParams {
@@ -121,6 +129,7 @@ pub struct E3RouterParams {
     recovered_selections: Vec<CiphernodeSelected>,
     teardown_grace: Duration,
     complete_on_restart: HashSet<E3id>,
+    fail_on_restart: HashMap<E3id, E3Stage>,
 }
 
 impl E3Router {
@@ -132,6 +141,7 @@ impl E3Router {
             recovered_selections: vec![],
             teardown_grace: SLASHABLE_FAILURE_GRACE,
             complete_on_restart: HashSet::new(),
+            fail_on_restart: HashMap::new(),
             recovery_store: repositories.request_router_checkpoint(),
             store: repositories.router(),
         };
@@ -153,6 +163,8 @@ impl E3Router {
             recovered_selections: params.recovered_selections,
             teardown_grace: params.teardown_grace,
             complete_on_restart: params.complete_on_restart,
+            fail_on_restart: params.fail_on_restart,
+            failures_delivered: HashSet::new(),
         }
     }
 }
