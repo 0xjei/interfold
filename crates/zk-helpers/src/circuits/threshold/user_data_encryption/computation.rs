@@ -213,21 +213,14 @@ impl Computation for Bounds {
 
         // e0 = e1 in the fhe.rs
         let e0_bound: u128 = if threshold_params.get_error1_variance() <= &BigUint::from(16u32) {
-            cbd_bound as u128
+            threshold_params.get_error1_variance().to_u128().unwrap() * 2
         } else {
             uniform_bound.to_u128().unwrap()
         };
         let e1_bound = cbd_bound; // e1 = e2 in the fhe.rs
 
-        let ptxt_up_bound = (t.clone() - BigInt::from(1)) / BigInt::from(2);
-        let ptxt_low_bound: BigInt = if (t.clone() % BigInt::from(2)) == BigInt::from(1) {
-            -1 * ptxt_up_bound.clone()
-        } else {
-            -1 * ptxt_up_bound.clone() - BigInt::from(1)
-        };
-
-        let k1_low_bound: BigInt = BigInt::from(-1) * ptxt_low_bound.clone();
-        let k1_up_bound: BigInt = ptxt_up_bound.clone();
+        let k1_low_bound = BigInt::from(0);
+        let k1_up_bound: BigInt = &t - BigInt::from(1);
 
         // Calculate bounds for each CRT basis
         let moduli: Vec<u64> = ctx.moduli_operators().iter().map(|q| **q).collect();
@@ -251,18 +244,12 @@ impl Computation for Bounds {
             // so bounding each term on the right and dividing by q bounds `r`:
             //   |pk * u| <= n * (q-1)/2 (negacyclic convolution of n terms, |u| <= u_bound),
             //   |ct| <= (q-1)/2, |k0 * k1| <= |k0| * k1_bound, |e| <= e_bound.
-            // Both sides are symmetric, so one bound covers the two-sided range check.
+            // The bound holds for `|r|`, so one bound covers the two-sided range check.
             //
             // ct0 takes the *lifted* `e0_bound`, not its residue at q_i: the reduced identity reads
             // the lifted `e0` directly now that the CRT split and `e0is` are gone.
-            // Both k1 bounds are stored as positive magnitudes, so take the larger of the two:
-            // for even `t` the low side is the wider one by one.
-            let k1_max = if k1_up_bound > k1_low_bound {
-                k1_up_bound.clone()
-            } else {
-                k1_low_bound.clone()
-            };
-            let ct0_r_bound: BigInt = (&k1_max * k0qi.abs()
+            // `k1` lies in `[0, t - 1]`, so `k1_up_bound` is its largest magnitude.
+            let ct0_r_bound: BigInt = (&k1_up_bound * k0qi.abs()
                 + (&n * u_bound + BigInt::from(2)) * &qi_bound
                 + BigInt::from(e0_bound))
                 / &qi_bigint;
@@ -316,18 +303,19 @@ impl Computation for Inputs {
         let moduli = threshold_params.moduli();
 
         let t = threshold_params.plaintext();
+        let k0is = compute_k0is(moduli, t)?;
         let n = threshold_params.degree() as u64;
         let q_mod_t = (&modulus_q % t)
             .to_u64()
             .ok_or_else(|| CircuitsErrors::Other("Failed to convert q_mod_t to u64".into()))?; // [q]_t
 
         // Encrypt using the provided public key to ensure ciphertext matches the key.
-        let (ct, u, e0, e1) = data
+        let (ct, intermediates) = data
             .public_key
-            .try_encrypt_extended(&data.plaintext, &mut rand::rng())?;
+            .try_encrypt_with_intermediates(&data.plaintext, &mut rand::rng())?;
 
         // Reconstruct e0 coefficients mod Q (CRT) for e0_quotient computation.
-        let mut e0_mod_q = Polynomial::from_fhe_polynomial(&e0);
+        let mut e0_mod_q = Polynomial::from_fhe_polynomial(intermediates.error_0());
 
         e0_mod_q.reverse();
         e0_mod_q.center(&modulus_q);
@@ -342,11 +330,14 @@ impl Computation for Inputs {
         let mut k1 = Polynomial::from_u64_vector(k1_u64);
 
         k1.reverse();
-        k1.center(&BigInt::from(t));
 
         // Reconstruct u and e1 as polynomials (only the first limb is needed)
-        let mut u = CrtPolynomial::from_fhe_polynomial(&u).limb(0).clone();
-        let mut e1 = CrtPolynomial::from_fhe_polynomial(&e1).limb(0).clone();
+        let mut u = CrtPolynomial::from_fhe_polynomial(intermediates.randomness())
+            .limb(0)
+            .clone();
+        let mut e1 = CrtPolynomial::from_fhe_polynomial(intermediates.error_1())
+            .limb(0)
+            .clone();
 
         u.center(&BigInt::from(moduli[0]));
         u.reverse();
@@ -358,7 +349,7 @@ impl Computation for Inputs {
         let mut ct1 = CrtPolynomial::from_fhe_polynomial(&ct[1]);
         let mut pk0 = CrtPolynomial::from_fhe_polynomial(&pk.c[0]);
         let mut pk1 = CrtPolynomial::from_fhe_polynomial(&pk.c[1]);
-        let mut e0 = CrtPolynomial::from_fhe_polynomial(&e0);
+        let mut e0 = CrtPolynomial::from_fhe_polynomial(intermediates.error_0());
 
         ct0.reverse();
         ct1.reverse();
@@ -407,7 +398,7 @@ impl Computation for Inputs {
             );
 
             // k0qi = -t^{-1} mod qi
-            let k0qi = BigInt::from(qi.inv(qi.neg(t)).unwrap());
+            let k0qi = BigInt::from(k0is[i]);
 
             // ki = k1 * k0qi
             let ki = k1.scalar_mul(&k0qi);
@@ -593,5 +584,37 @@ mod tests {
 
         assert_eq!(max_pk_bound.clone(), BigUint::from(34359701504u64));
         assert_eq!(bits.pk_bit, expected_bits);
+    }
+
+    #[test]
+    fn insecure_e0_bound_matches_error1_sampler() {
+        let preset = BfvPreset::InsecureThreshold512;
+        let bounds = Bounds::compute(preset, &()).unwrap();
+        let bits = Bits::compute(preset, &bounds).unwrap();
+
+        assert_eq!(bounds.e0_bound, BigUint::from(6u32));
+        assert_eq!(bounds.e1_bound, BigUint::from(20u32));
+        assert_eq!(bits.e0_bit, 3);
+    }
+
+    #[test]
+    fn encryption_witness_respects_ct0_r_bounds() {
+        for preset in [
+            BfvPreset::InsecureThreshold512,
+            BfvPreset::SecureThreshold8192,
+        ] {
+            let sample = UserDataEncryptionCircuitData::generate_sample(preset).unwrap();
+            let bounds = Bounds::compute(preset, &()).unwrap();
+            let inputs = Inputs::compute(preset, &sample).unwrap();
+            for (i, limb) in inputs.ct0_r.limbs.iter().enumerate() {
+                let bound = BigInt::from(bounds.ct0_r_bounds[i].clone());
+                for (j, coefficient) in limb.coefficients().iter().enumerate() {
+                    assert!(
+                        coefficient.abs() <= bound,
+                        "{preset:?} ct0_r[{i}][{j}] = {coefficient} exceeds {bound}"
+                    );
+                }
+            }
+        }
     }
 }

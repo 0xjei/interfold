@@ -39,7 +39,7 @@ import {
   type CircuitPreset,
 } from './circuit-constants'
 
-const CIRCUIT_VERSION = 'interfold-bfv-v3'
+const CIRCUIT_VERSION = 'interfold-bfv-v4'
 
 /**
  * Reduce Cargo.lock to the external crate pins that the circuit generators compile against.
@@ -411,7 +411,7 @@ class NoirCircuitBuilder {
 
   private bfvConfig(preset: CircuitPreset, committee: CircuitCommittee) {
     const { h, t, n } = COMMITTEE_PARAMS[committee]
-    const paramSet = preset === CIRCUIT_PRESETS.INSECURE_512 ? 0 : 1
+    const paramSet = preset === CIRCUIT_PRESETS.INSECURE_512 ? 0 : 2
     const committeeSize = ALL_COMMITTEES.indexOf(committee)
     const params = paramSet === 0 ? BFV_PARAMS.insecure512 : BFV_PARAMS.secure8192
     const encodedParams = AbiCoder.defaultAbiCoder().encode(
@@ -505,6 +505,83 @@ class NoirCircuitBuilder {
   syncProtocolConfig(preset: CircuitPreset, committee: CircuitCommittee): void {
     this.patchUtilsTs(preset, committee)
     this.writeActiveCryptoConfig(preset, committee)
+  }
+
+  /** Regenerates each circuit's preset constants from the Rust parameter set. */
+  syncPresetConfigs(preset: CircuitPreset, committee: CircuitCommittee): void {
+    const tier = PRESET_NOIR_CONFIG[preset]
+    const configDir = join(this.rootDir, 'circuits', 'lib', 'src', 'configs', tier)
+    const temporaryDir = mkdtempSync(join(tmpdir(), 'interfold-preset-config-'))
+    const sources = [
+      { circuit: 'pk', file: 'dkg.nr', prefix: 'PK_', common: [] },
+      { circuit: 'share-computation', file: 'dkg.nr', prefix: 'SHARE_COMPUTATION_', common: [] },
+      {
+        circuit: 'share-encryption',
+        file: 'dkg.nr',
+        prefix: 'SHARE_ENCRYPTION_',
+        common: ['N', 'L', 'QIS', 'PLAINTEXT_MODULUS', 'Q_MOD_T', 'Q_MOD_T_CENTERED'],
+      },
+      { circuit: 'share-decryption', file: 'dkg.nr', prefix: 'SHARE_DECRYPTION_', common: [] },
+      { circuit: 'user-data-encryption', file: 'threshold.nr', prefix: 'USER_DATA_ENCRYPTION_', common: [] },
+      { circuit: 'pk-generation', file: 'threshold.nr', prefix: 'PK_GENERATION_', common: ['N', 'L', 'QIS', 'PLAINTEXT_MODULUS', 'CRP'] },
+      { circuit: 'pk-aggregation', file: 'threshold.nr', prefix: 'PK_AGGREGATION_', common: [] },
+      { circuit: 'threshold-share-decryption', file: 'threshold.nr', prefix: 'THRESHOLD_SHARE_DECRYPTION_', common: [] },
+      {
+        circuit: 'decrypted-shares-aggregation',
+        file: 'threshold.nr',
+        prefix: 'DECRYPTED_SHARES_AGGREGATION_',
+        common: ['Q_MOD_T', 'Q_MOD_T_CENTERED', 'Q_INVERSE_MOD_T'],
+      },
+    ]
+    const originals = new Map<string, string>()
+    const pending = new Map<string, string>()
+
+    try {
+      for (const source of sources) {
+        const outputDir = join(temporaryDir, source.circuit)
+        mkdirSync(outputDir)
+        execFileSync(
+          'cargo',
+          [
+            'run',
+            '--quiet',
+            '-p',
+            'e3-zk-helpers',
+            '--bin',
+            'zk_cli',
+            '--',
+            '--circuit',
+            source.circuit,
+            '--preset',
+            tier,
+            '--committee',
+            committee,
+            '--output',
+            outputDir,
+          ],
+          { cwd: this.rootDir, stdio: 'pipe' },
+        )
+        const targetPath = join(configDir, source.file)
+        const generated = readFileSync(join(outputDir, 'configs.nr'), 'utf8')
+        if (!originals.has(targetPath)) originals.set(targetPath, readFileSync(targetPath, 'utf8'))
+        let updated = pending.get(targetPath) ?? originals.get(targetPath)!
+        const committed = noirGlobalDeclarations(updated)
+        for (const [name, declaration] of noirGlobalDeclarations(generated)) {
+          if (!name.startsWith(source.prefix) && !source.common.includes(name)) continue
+          const current = committed.get(name)
+          // `nargo fmt` wraps long committed declarations. A layout difference alone is no change.
+          if (current === undefined || current.replace(/\s+/g, '') === declaration.replace(/\s+/g, '')) continue
+          updated = updated.replace(current, () => declaration)
+        }
+        pending.set(targetPath, updated)
+      }
+      const changed = [...pending].filter(([targetPath, updated]) => updated !== originals.get(targetPath))
+      for (const [targetPath, updated] of changed) writeFileSync(targetPath, updated)
+      if (changed.length > 0) execSync('nargo fmt', { cwd: join(this.rootDir, 'circuits', 'lib'), stdio: ['ignore', 'pipe', 'inherit'] })
+      console.log(`   📋 Regenerated BFV circuit constants for ${preset}/${committee}`)
+    } finally {
+      rmSync(temporaryDir, { recursive: true, force: true })
+    }
   }
 
   /** Writes the circuit-bound constants consumed by Interfold. */
@@ -1517,7 +1594,7 @@ async function main() {
       }
       options.committee = val as CircuitCommittee | 'all'
     } else if (arg === '--skip-utils-patch') options.skipUtilsPatch = true
-    else if (['hash', 'build', 'sync-config'].includes(arg)) command = arg
+    else if (['hash', 'build', 'sync-config', 'sync-preset'].includes(arg)) command = arg
   }
 
   const builder = new NoirCircuitBuilder(undefined, options)
@@ -1533,6 +1610,11 @@ async function main() {
       throw new Error('sync-config requires one preset and one committee')
     }
     builder.syncProtocolConfig(options.preset ?? CIRCUIT_PRESETS.INSECURE_512, options.committee ?? CIRCUIT_COMMITTEES.MINIMUM)
+  } else if (command === 'sync-preset') {
+    if (options.preset === 'all' || options.committee === 'all') {
+      throw new Error('sync-preset requires one preset and one committee')
+    }
+    builder.syncPresetConfigs(options.preset ?? CIRCUIT_PRESETS.INSECURE_512, options.committee ?? CIRCUIT_COMMITTEES.MINIMUM)
   } else {
     const result = await builder.buildAll()
     builder.writeGitHubOutput(result)
@@ -1544,7 +1626,7 @@ function showHelp() {
   console.log(`
 Usage: build-circuits [command] [options]
 
-Commands: build (default), hash, sync-config
+Commands: build (default), hash, sync-config, sync-preset
 
 Options:
   --group <groups>    Circuit groups (comma-separated: dkg,threshold)

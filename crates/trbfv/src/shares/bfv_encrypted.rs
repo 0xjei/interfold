@@ -62,8 +62,8 @@ fn debug_vec_arcbytes(v: &[ArcBytes], f: &mut std::fmt::Formatter) -> std::fmt::
 impl BfvEncryptedShare {
     /// Encrypt a Shamir share and return encryption randomness for ZK proofs.
     ///
-    /// Encrypts each modulus row with `try_encrypt_extended` and captures the encryption
-    /// randomness (u, e0, e1) that C3a/C3b share encryption proofs need.
+    /// Encrypts each modulus row with `try_encrypt_with_intermediates` and captures the
+    /// encryption randomness (u, e0, e1) that C3a/C3b share encryption proofs need.
     pub fn encrypt_extended<R: RngCore + CryptoRng>(
         share: &ShamirShare,
         recipient_pk: &PublicKey,
@@ -83,17 +83,17 @@ impl BfvEncryptedShare {
             let pt = Plaintext::try_encode(&share_vec, Encoding::poly(), params)
                 .context("Failed to encode share as plaintext")?;
 
-            let (ct, u_rns, e0_rns, e1_rns) = recipient_pk
-                .try_encrypt_extended(&pt, rng)
+            let (ct, intermediates) = recipient_pk
+                .try_encrypt_with_intermediates(&pt, rng)
                 .context("Failed to encrypt share (extended)")?;
 
             ciphertexts.push(ArcBytes::from_bytes(&ct.to_bytes()));
             witnesses.push(BfvEncryptionWitness {
                 share_row: share_vec,
                 ciphertext: ct,
-                u_rns,
-                e0_rns,
-                e1_rns,
+                u_rns: intermediates.randomness().clone(),
+                e0_rns: intermediates.error_0().clone(),
+                e1_rns: intermediates.error_1().clone(),
             });
         }
 

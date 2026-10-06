@@ -2,6 +2,7 @@
 
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { assertSdkMinimumCircuits } from '../src/circuits/assert-minimum-circuits'
+import { ParamSet } from '../src/contracts/types'
 import { cryptoConfigIdForParamSet } from '../src/utils'
 
 const { readFileSync } = vi.hoisted(() => ({ readFileSync: vi.fn() }))
@@ -15,10 +16,11 @@ vi.mock('node:fs', async () => {
 })
 
 describe('SDK circuit selection', () => {
-  it('uses v3 configuration IDs for both BFV parameter sets', () => {
-    expect(cryptoConfigIdForParamSet(0)).toBe('0x20d76557cc2aee078754ad9a563d61d0697809da363f1979895ec15f6ea30db9')
-    expect(cryptoConfigIdForParamSet(1)).toBe('0x3115e08eb5c87d6d245eda5dff0cf377c42e29b9741f94fc7a83efc3da7da920')
-    expect(() => cryptoConfigIdForParamSet(2)).toThrow('Unsupported BFV parameter set: 2')
+  it('uses v4 configuration IDs and routes secure requests to slot 2', () => {
+    expect(ParamSet.Secure8192).toBe(2)
+    expect(cryptoConfigIdForParamSet(ParamSet.Insecure512)).toBe('0x119c9bde7d7a31aaeef3e696ea29f8590c611d431921b6981434bd2c0fb5f7d1')
+    expect(cryptoConfigIdForParamSet(ParamSet.Secure8192)).toBe('0x5ebb3432396f21cd97fca47e006b9dd38c021bf2902d3e555cf74cb91b28e44e')
+    expect(() => cryptoConfigIdForParamSet(1)).toThrow('Unsupported BFV parameter set: 1')
   })
 
   beforeEach(() => {

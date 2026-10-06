@@ -12,19 +12,19 @@ import { IInterfold } from "../interfaces/IInterfold.sol";
 // support insecure and secure BFV with every committee size.
 library ActiveCryptoConfig {
     bytes32 internal constant ENCRYPTION_SCHEME_ID = keccak256("fhe.rs:BFV");
-    bytes32 internal constant CIRCUIT_VERSION = keccak256("interfold-bfv-v3");
+    bytes32 internal constant CIRCUIT_VERSION = keccak256("interfold-bfv-v4");
 
     bytes32 internal constant INSECURE_CONFIG_ID =
-        0x20d76557cc2aee078754ad9a563d61d0697809da363f1979895ec15f6ea30db9;
+        0x119c9bde7d7a31aaeef3e696ea29f8590c611d431921b6981434bd2c0fb5f7d1;
     uint8 internal constant INSECURE_PARAM_SET = 0;
     bytes32 internal constant INSECURE_PARAM_SET_HASH =
         0x18c6d8650486b997d48aa2d285fae878fb267b268332d056a3e8527d50e87b4f;
 
     bytes32 internal constant SECURE_CONFIG_ID =
-        0x3115e08eb5c87d6d245eda5dff0cf377c42e29b9741f94fc7a83efc3da7da920;
-    uint8 internal constant SECURE_PARAM_SET = 1;
+        0x5ebb3432396f21cd97fca47e006b9dd38c021bf2902d3e555cf74cb91b28e44e;
+    uint8 internal constant SECURE_PARAM_SET = 2;
     bytes32 internal constant SECURE_PARAM_SET_HASH =
-        0xd7068fdcc1910f5e49c8b05530cf74f876cadee2a1caf797a40b1ae53ae143ec;
+        0x80775a19b6126a12943f9c1c53f92299f0c92ece819b625026ab1406bbbe0721;
 
     uint8 internal constant MINIMUM_COMMITTEE_SIZE = 0;
     uint32 internal constant MINIMUM_T = 1;

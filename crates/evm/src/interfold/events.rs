@@ -30,7 +30,7 @@ fn crypto_config_id(params: &[u8]) -> B256 {
         (
             keccak256(b"fhe.rs:BFV"),
             keccak256(params),
-            keccak256(b"interfold-bfv-v3"),
+            keccak256(b"interfold-bfv-v4"),
         )
             .abi_encode(),
     )
@@ -555,11 +555,11 @@ mod tests {
         let expected = [
             (
                 0,
-                "0x20d76557cc2aee078754ad9a563d61d0697809da363f1979895ec15f6ea30db9",
+                "0x119c9bde7d7a31aaeef3e696ea29f8590c611d431921b6981434bd2c0fb5f7d1",
             ),
             (
-                1,
-                "0x3115e08eb5c87d6d245eda5dff0cf377c42e29b9741f94fc7a83efc3da7da920",
+                2,
+                "0x5ebb3432396f21cd97fca47e006b9dd38c021bf2902d3e555cf74cb91b28e44e",
             ),
         ];
 
@@ -593,7 +593,11 @@ mod tests {
             assert_eq!(converted.params_preset, preset);
 
             let params = encode_bfv_params(&BfvParamSet::from(preset).build_arc());
-            for version in [b"interfold-bfv-v1", b"interfold-bfv-v2"] {
+            for version in [
+                b"interfold-bfv-v1",
+                b"interfold-bfv-v2",
+                b"interfold-bfv-v3",
+            ] {
                 let mut legacy_event = event.clone();
                 legacy_event.cryptoConfigId = keccak256(
                     (
@@ -786,6 +790,36 @@ mod tests {
         let log = event.encode_log_data();
 
         assert!(extractor(&log, log.topics(), 100).unwrap().is_none());
+    }
+
+    #[test]
+    fn historical_secure_slot_is_not_decoded_with_new_secure_parameters() {
+        let event = IInterfold::E3Requested {
+            e3Id: U256::from(20),
+            e3: IInterfold::E3 {
+                seed: U256::ZERO,
+                committeeSize: 0,
+                requestBlock: U256::ZERO,
+                inputWindow: [U256::ZERO; 2],
+                encryptionSchemeId: B256::ZERO,
+                e3Program: Address::ZERO,
+                paramSet: 1,
+                customParams: Bytes::new(),
+                decryptionVerifier: Address::ZERO,
+                pkVerifier: Address::ZERO,
+                committeePublicKey: B256::ZERO,
+                ciphertextOutput: B256::ZERO,
+                plaintextOutput: Bytes::new(),
+                requester: Address::ZERO,
+                ciphertextCommitment: B256::ZERO,
+            },
+            cryptoConfigId: "0xd9c86e581f8291ffb5b63595600e8d096ed30b16e2e0a6634a76c22b1f58fb4e"
+                .parse()
+                .unwrap(),
+        };
+        let log = event.encode_log_data();
+
+        assert!(extractor(&log, log.topics(), 1).unwrap().is_none());
     }
 
     #[test]

@@ -181,6 +181,20 @@ every section.
 - Proof multiplicity: C2a/C2b singleton per recipient; C3a/C3b follow configured Shamir
   multiplicities. Witness dimensions come from the **active preset**, never incidental vector sizes.
   — `ARCHITECTURE.md`; `CRATES_ARCHITECTURE.md`
+- fhe.rs v0.4.1 derives additive smudging bounds as `2^(lambda + 1) * degree * B_C` and uses
+  sampler-specific encryption error bounds. The C1/C2 Noir bit widths must use the same bounds as
+  the Rust sampler for each preset and committee. Regenerate them with `pnpm build:circuits`;
+  rebuild the matching verifier artifacts before deploying a protocol-version-7 node. —
+  `flow-trace/04`; `scripts/build-circuits.ts`
+- fhe.rs v0.4.1 passes plaintext-scaled ballot coefficients as non-centered residues. Both CRISP
+  vote circuits must check `Q_MOD_T`, rather than `Q_MOD_T_CENTERED`, against those coefficients. —
+  `examples/CRISP/circuits/bin/{crisp,crisp_onchain}/src/main.nr`
+- The C3 and user-data-encryption `k1` witnesses use non-centered residues in `[0, t - 1]`. Their
+  Noir equations and asymmetric quotient bounds must match the Rust witnesses. —
+  `circuits/lib/src/core/dkg/share_encryption.nr`; `crates/zk-helpers/src/circuits/`
+- Mainnet secure parameter-set index 1 contains the old tuple. Version 7 registers the new tuple at
+  index 2 and must not reinterpret old index-1 E3s as version-7 secure requests. — `flow-trace/07`;
+  `crates/fhe-params/src/presets.rs`; `ActiveCryptoConfig.sol`
 - The local C1, C2a, C2b, and every C3a and C3b proof must complete and be signed before any
   `ThresholdShareCreated` is published. C4 through C7 belong to later phases. —
   `crates/zk-prover/src/proof_request/effects/publish_threshold_shares.rs`; `flow-trace/04`
@@ -352,7 +366,7 @@ every section.
   committed coefficients. With the checked helper on the three commitments, the secure `crisp`
   circuit measured 2,520,034 gates, above the browser ceiling. The exemption holds only for that
   shape of relation, and only while every commitment in it has a bounded opening that something else
-  fixes: the ballot through the centered range checks of `user_data_encryption_ct0/ct1`, and the
+  fixes: the ballot through the range checks of `user_data_encryption_ct0/ct1`, and the
   parent and the published result because `chain_head_per_slot` takes an entry only when its bytes
   reproduce its commitment and it extends the selected head. A check at one point over those
   commitments, or a Secure Process that follows a parent by its stored commitment without its bytes,
@@ -553,7 +567,7 @@ every section.
   `D - MAX_MSG_NON_ZERO_COEFFS + (MAX_MSG_NON_ZERO_COEFFS mod num_options)` with the options back to
   front; `crisp_lib::utils::ballot_layout` derives that offset, both checkers use it, and no code
   may hand-code it. Each coefficient inside an option segment encodes one bit as 0 or
-  `q_mod_t_centered`, everything outside the ballot region must be zero, and a mask's plaintext must
+  `q_mod_t`, everything outside the ballot region must be zero, and a mask's plaintext must
   be zero everywhere. Indexing as if the polynomial were the message width makes both checks read
   only padding: every vote passes any balance bound, and a mask — which needs no signature and may
   be written to any eligible slot — can carry an arbitrary payload into someone else's ballot. Tests

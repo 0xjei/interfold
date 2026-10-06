@@ -210,24 +210,19 @@ impl<let N: u32, let L: u32, let BIT_PK: u32, let BIT_CT: u32, let BIT_U: u32, l
         );
     }
 
-    /// Computes the scaled message polynomial k1 from the raw share.
+    /// Checks the carries `z` of the scaled message: `k1 == q_mod_t * m - t * z`, so the scaled
+    /// message need never be materialised.
     ///
-    /// Each coefficient is transformed as:
-    ///   k1[i] = (Q_mod_t * message[i]) mod t
-    /// then centered to [-t/2, t/2) to produce the BFV plaintext encoding.
-    /// Rounding carries `z` with `k1 == q_mod_t * m - t * z`, so the scaled message need never be
-    /// materialised.
+    /// `k1` is `q_mod_t * m` reduced into `[0, t)`, the BFV plaintext encoding. Writing that
+    /// reduction as a carry makes it an affine term the quotient can absorb: see
+    /// `scaled_quotient_terms`.
     ///
-    /// `k1` is `q_mod_t * m` reduced into the centred window modulo `t`. Writing that reduction as a
-    /// carry makes it an affine term the quotient can absorb: see `scaled_quotient_terms`.
-    ///
-    /// `z` is a hint, pinned by the shifted remainder: `q_mod_t * m - t * z + (t - 1) / 2` lies in
-    /// `[0, t)` for exactly one `z`, because any `t` consecutive integers hold one representative of
-    /// each residue class. `BIT_Z` bounds `z` so the subtraction is an integer identity rather than a
-    /// modular one -- `z` is at most `q_mod_t`, since `m < t`.
+    /// `z` is a hint, pinned by the remainder: `q_mod_t * m - t * z` lies in `[0, t)` for exactly
+    /// one `z`, because any `t` consecutive integers hold one representative of each residue class.
+    /// `BIT_Z` bounds `z` so the subtraction is an integer identity rather than a modular one --
+    /// `z` is at most `q_mod_t`, since `m < t`.
     fn check_rounding_carries(self) -> Polynomial<N> {
         let t = self.configs.t;
-        let half = (t - 1) / 2;
         let z = self.z[0];
 
         for j in 0..N {
@@ -235,9 +230,9 @@ impl<let N: u32, let L: u32, let BIT_PK: u32, let BIT_CT: u32, let BIT_U: u32, l
             // `BIT_Z` keeps `t * z` far below the field prime, so the subtraction below is an
             // integer identity rather than a modular one. `z` is at most `q_mod_t`, since `m < t`.
             z.coefficients[j].assert_max_bit_size::<BIT_Z>();
-            // Exactly one `z` puts the shifted remainder in `[0, t)`, because any `t` consecutive
-            // integers hold one representative of each residue class. That fixes `z` uniquely.
-            assert_in_range::<BIT_MSG>(scaled + half - t * z.coefficients[j], t);
+            // Exactly one `z` puts the remainder in `[0, t)`, because any `t` consecutive integers
+            // hold one representative of each residue class. That fixes `z` uniquely.
+            assert_in_range::<BIT_MSG>(scaled - t * z.coefficients[j], t);
         }
 
         z
@@ -302,6 +297,11 @@ impl<let N: u32, let L: u32, let BIT_PK: u32, let BIT_CT: u32, let BIT_U: u32, l
         }
     }
 
+    /// Computes the scaled message polynomial k1 from the raw share.
+    ///
+    /// Each coefficient is transformed as:
+    ///   k1[i] = (Q_mod_t * message[i]) mod t
+    /// The residue stays in [0, t) to match the BFV plaintext encoding.
     fn compute_scaled_message(self) -> Polynomial<N> {
         let t = self.configs.t;
         // t < 2^62 (plaintext modulus); q_mod_t, msg_i < t: all safe for ModU64.
@@ -309,25 +309,9 @@ impl<let N: u32, let L: u32, let BIT_PK: u32, let BIT_CT: u32, let BIT_U: u32, l
         let q_mod_t: Field = self.configs.q_mod_t;
         let mut k1_coeffs: [Field; N] = [0; N];
 
-        // Integer division for t_half; t < 2^62 so u64 is sufficient.
-        let t_half: u64 = (t as u64) / 2;
-
         for i in 0..N {
             let msg_i: Field = self.message.coefficients[i];
-            let q_times_m_mod_t = t_mod.mul_mod(q_mod_t, msg_i);
-
-            // Check if centering is needed (value > t/2 means negative in centered form)
-            let needs_centering = (q_times_m_mod_t as u64) > t_half;
-
-            k1_coeffs[i] = if needs_centering {
-                // Value is in (t/2, t), negative in centered form
-                // Represent as P - magnitude (i.e., 0 - magnitude in Field)
-                let magnitude = t - q_times_m_mod_t;
-                0 - magnitude
-            } else {
-                // Value is in [0, t/2], stays positive
-                q_times_m_mod_t
-            };
+            k1_coeffs[i] = t_mod.mul_mod(q_mod_t, msg_i);
         }
 
         Polynomial { coefficients: k1_coeffs }
@@ -551,9 +535,9 @@ impl<let N: u32, let L: u32, let BIT_PK: u32, let BIT_CT: u32, let BIT_U: u32, l
 /// An honest witness satisfies both reduced legs, with nonzero quotients on each.
 ///
 /// Worked by hand at `N = 4`, `q = 97`, `t = 5`, `q_mod_t = 2`, `k0 = -t^-1 mod q = 58`.
-/// `message = [0, 0, 1, 2]` scales to the centered `k1 = [0, 0, 2, -1]`, so the ct0 right-hand side
-/// is `[-50, -30, -10, -50] + [0, 0, 0, 1] + 58 * k1 = [-50, -30, 106, -107]`. Three coefficients
-/// fall outside `+/-(q-1)/2`, giving `ct0is = [47, -30, 9, -10]` and `ct0_r = [1, 0, -1, 1]`. The
+/// `message = [0, 0, 1, 2]` scales to `k1 = [0, 0, 2, 4]` in `[0, t)`, so the ct0 right-hand side
+/// is `[-50, -30, -10, -50] + [0, 0, 0, 1] + 58 * k1 = [-50, -30, 106, 183]`. Three coefficients
+/// fall outside `+/-(q-1)/2`, giving `ct0is = [47, -30, 9, -11]` and `ct0_r = [1, 0, -1, -2]`. The
 /// ct1 leg has no `k0 * k1` term: `[20, 60, -40, -19]` centers to `[20, -37, -40, -19]` with
 /// `ct1_r = [0, -1, 0, 0]`.
 ///
@@ -571,9 +555,9 @@ fn reduced_identity_fixture() -> ShareEncryption<4, 1, 6, 6, 1, 1, 1, 3, 3, 3, 3
     let e0 = Polynomial::new([0, 0, 0, 1]);
     let e1 = Polynomial::new([0, 0, 0, 1]);
     let message = Polynomial::new([0, 0, 1, 2]);
-    let ct0 = Polynomial::new([47, -30, 9, -10]);
+    let ct0 = Polynomial::new([47, -30, 9, -11]);
     let ct1 = Polynomial::new([20, -37, -40, -19]);
-    let ct0_r = Polynomial::new([1, 0, -1, 1]);
+    let ct0_r = Polynomial::new([1, 0, -1, -2]);
     let ct1_r = Polynomial::new([0, -1, 0, 0]);
 
     // t, q_mod_t, qis, k0is, pk_bounds, e0_bound, e1_bound, u_bound, ct0_r, ct1_r, msg_bound,
@@ -672,20 +656,20 @@ fn ct1_below_centered_bound_is_rejected() {
 /// `BETA = [(31 * 13 + 1) / 101, (95 * 13 + 1) / 103]`, and
 /// `ALPHA = [(31 * 3 + 8) / 101, (95 * 3 + 24) / 103]`.
 ///
-/// `message = [0, 1, 2, 3]` gives carries `z = [0, 0, 0, 1]` and so `k1 = [0, 3, 6, -4]`, inside the
-/// centred window `+/-6`.
+/// `message = [0, 1, 2, 9]` gives carries `z = [0, 0, 0, 2]` and so `k1 = [0, 3, 6, 1]`, inside
+/// `[0, t)`.
 fn scaled_fixture(
     z: Polynomial<4>,
     ct0_r: [Polynomial<4>; 2],
 ) -> ShareEncryption<4, 2, 6, 6, 1, 2, 2, 4, 4, 4, 2, 4, 4, 4> {
     let pk0 = [Polynomial::new([20, -30, 10, 5]), Polynomial::new([25, -15, 30, -20])];
     let pk1 = [Polynomial::new([5, 10, -5, 15]), Polynomial::new([-10, 20, -25, 5])];
-    let ct0 = [Polynomial::new([-9, 27, -47, 2]), Polynomial::new([6, -29, -1, -36])];
+    let ct0 = [Polynomial::new([-9, 27, -47, -45]), Polynomial::new([6, -29, -1, 27])];
     let ct1 = [Polynomial::new([-10, 6, 0, -26]), Polynomial::new([-15, -14, 35, -26])];
     let u = Polynomial::new([0, 1, 0, -1]);
     let e0 = Polynomial::new([1, 0, -1, 0]);
     let e1 = Polynomial::new([0, 1, 0, -1]);
-    let message = Polynomial::new([0, 1, 2, 3]);
+    let message = Polynomial::new([0, 1, 2, 9]);
     let ct1_r = [Polynomial::new([0, 0, 0, 0]), Polynomial::new([0, 0, 0, 0])];
 
     // ..., msg_bound, scaled_quotient, small_d, alpha, beta, q0_offset, q0_diff_offset, q1_offset
@@ -730,7 +714,7 @@ fn scaled_fixture(
 
 /// The honest ct0 quotients for [`scaled_fixture`], before `ALPHA * m - BETA * z` folds in.
 fn honest_scaled_quotients() -> [Polynomial<4>; 2] {
-    [Polynomial::new([0, -1, -2, 1]), Polynomial::new([0, -3, -5, 3])]
+    [Polynomial::new([0, -1, -2, -1]), Polynomial::new([0, -3, -5, -1])]
 }
 
 /// The scaled path accepts an honest witness on both legs and both limbs.
@@ -739,24 +723,24 @@ fn honest_scaled_quotients() -> [Polynomial<4>; 2] {
 /// what insecure-512 uses. Without this the production path would be the untested one.
 #[test]
 fn scaled_quotient_path_accepts_honest_witness() {
-    let _ = scaled_fixture(Polynomial::new([0, 0, 0, 1]), honest_scaled_quotients()).execute();
+    let _ = scaled_fixture(Polynomial::new([0, 0, 0, 2]), honest_scaled_quotients()).execute();
 }
 
 /// A tampered carry must be rejected.
 ///
 /// `z` is prover-supplied now rather than hinted in-circuit, so this is the check that it is pinned:
-/// `q_mod_t * m - t * z + (t - 1) / 2` lies in `[0, t)` for exactly one `z`, and moving any
-/// coefficient off that value leaves the window.
+/// `q_mod_t * m - t * z` lies in `[0, t)` for exactly one `z`, and moving any coefficient off that
+/// value leaves the window.
 #[test(should_fail)]
 fn tampered_rounding_carry_is_rejected() {
-    // Honest carries are [0, 0, 0, 1]; claim a zero for the last coefficient.
-    let _ = scaled_fixture(Polynomial::new([0, 0, 0, 0]), honest_scaled_quotients()).execute();
+    // Honest carries are [0, 0, 0, 2]; claim a one for the last coefficient.
+    let _ = scaled_fixture(Polynomial::new([0, 0, 0, 1]), honest_scaled_quotients()).execute();
 }
 
 /// A carry inflated the other way must also be rejected, not just a deflated one.
 #[test(should_fail)]
 fn inflated_rounding_carry_is_rejected() {
-    let _ = scaled_fixture(Polynomial::new([1, 0, 0, 1]), honest_scaled_quotients()).execute();
+    let _ = scaled_fixture(Polynomial::new([1, 0, 0, 2]), honest_scaled_quotients()).execute();
 }
 
 /// A tampered ct0 quotient must break the evaluation check.
@@ -767,8 +751,8 @@ fn inflated_rounding_carry_is_rejected() {
 #[test(should_fail)]
 fn tampered_scaled_quotient_is_rejected() {
     let mut tampered = honest_scaled_quotients();
-    tampered[0] = Polynomial::new([0, -1, -2, 2]);
-    let _ = scaled_fixture(Polynomial::new([0, 0, 0, 1]), tampered).execute();
+    tampered[0] = Polynomial::new([0, -1, -2, 0]);
+    let _ = scaled_fixture(Polynomial::new([0, 0, 0, 2]), tampered).execute();
 }
 
 /// The same on the second limb, which is bounded only through its difference from the first.
@@ -778,6 +762,6 @@ fn tampered_scaled_quotient_is_rejected() {
 #[test(should_fail)]
 fn tampered_second_limb_quotient_is_rejected() {
     let mut tampered = honest_scaled_quotients();
-    tampered[1] = Polynomial::new([0, -3, -5, 4]);
-    let _ = scaled_fixture(Polynomial::new([0, 0, 0, 1]), tampered).execute();
+    tampered[1] = Polynomial::new([0, -3, -5, 0]);
+    let _ = scaled_fixture(Polynomial::new([0, 0, 0, 2]), tampered).execute();
 }

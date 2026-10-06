@@ -34,13 +34,13 @@ describe('encryptNumber', () => {
     it('should encrypt a number without crashing in a node environent', async () => {
       const value = await sdk.encryptNumber(10n, publicKey)
       expect(value).to.be.an.instanceof(Uint8Array)
-      expect(value.length).to.equal(9_242)
+      expect(value.length).to.equal(9_238)
       // TODO: test the encryption is correct
     })
     it('should encrypt a vector of numbers without crashing in a node environent', async () => {
       const value = await sdk.encryptVector(new BigUint64Array([1n, 2n]), publicKey)
       expect(value).to.be.an.instanceof(Uint8Array)
-      expect(value.length).to.equal(9_242)
+      expect(value.length).to.equal(9_238)
     })
 
     it('should validate a committee public key against its on-chain commitment', async () => {

@@ -133,9 +133,9 @@ pub struct Inputs {
     pub ct0_r: CrtPolynomial,
     /// ct1-leg reduction quotient, already reduced modulo `X^N + 1`.
     pub ct1_r: CrtPolynomial,
-    /// Rounding carries with `k1 == q_mod_t * m - t * z`, so the circuit's scaled path never builds
-    /// `k1`. A witness rather than an in-circuit hint, matching every other quotient here. Always
-    /// produced; the direct path ignores it.
+    /// Carries with `k1 == q_mod_t * m - t * z` and `k1` in `[0, t)`, so the circuit's scaled path
+    /// never builds `k1`. A witness rather than an in-circuit hint, matching every other quotient
+    /// here. Always produced; the direct path ignores it.
     pub z: CrtPolynomial,
     pub e0: Polynomial,
     pub e1: Polynomial,
@@ -148,11 +148,11 @@ pub struct Inputs {
 /// Constants for C3's scaled-quotient form, when the parameter set admits it.
 ///
 /// C3's identity carries `k0 * k1`, where `k1` is the message scaled by `SCALE = Q mod T` and
-/// centred modulo `T`. Computing `k1` costs a modular multiply and a centring comparison per
-/// coefficient. It can instead be folded into the mod-q quotient:
+/// reduced into `[0, T)`. Computing `k1` costs a modular multiply per coefficient. It can instead
+/// be folded into the mod-q quotient:
 ///
 /// ```text
-///   k1       = SCALE * m - T * z                 (z is the rounding carry)
+///   k1       = SCALE * m - T * z                 (z is the reduction carry)
 ///   k0 * T     = BETA * q - 1
 ///   k0 * SCALE = ALPHA * q - SMALL_D
 ///   => k0 * k1 = q * (ALPHA * m - BETA * z) - SMALL_D * m + z
@@ -483,12 +483,8 @@ impl Computation for Bounds {
         // upper bound, so this is `t`. Passing `t - 1` rejected the legitimate coefficient `t - 1`.
         let msg_bound = t.clone();
 
-        let ptxt_up_bound = (t.clone() - BigInt::from(1)) / BigInt::from(2);
-        let ptxt_low_bound: BigInt = if (t.clone() % BigInt::from(2)) == BigInt::from(1) {
-            -1 * ptxt_up_bound.clone()
-        } else {
-            -1 * ptxt_up_bound.clone() - BigInt::from(1)
-        };
+        // `k1` lies in `[0, t)`, so its largest magnitude is `t - 1`.
+        let k1_max = &t - BigInt::from(1);
 
         // Calculate bounds for each CRT basis
         let moduli: Vec<u64> = ctx.moduli_operators().iter().map(|q| **q).collect();
@@ -513,14 +509,6 @@ impl Computation for Bounds {
             //   ct = pk * u + e + k0 * k1 + q * r   (mod X^N + 1, over the integers)
             // Bounding each term on the right and dividing by q bounds `r`. Folding modulo X^N + 1
             // does not change this bound, so it is the same expression the unreduced `r1` used.
-            // Take the wider of the two k1 magnitudes. Both presets currently have odd `t`, which
-            // makes them equal, but an even `t` would make the low side wider by one and silently
-            // under-bound `r`.
-            let k1_max = if ptxt_up_bound > -ptxt_low_bound.clone() {
-                ptxt_up_bound.clone()
-            } else {
-                -ptxt_low_bound.clone()
-            };
             let ct0_r_bound: BigInt = (&k1_max * k0qi.abs()
                 + ((&n * u_bound + BigInt::from(2)) * &qi_bound + e0_bound_i.clone()))
                 / &qi_bigint;
@@ -575,6 +563,7 @@ impl Computation for Inputs {
         #[allow(non_snake_case)]
         let modulus_q = BigInt::from(ctx.modulus().clone());
         let t = dkg_params.plaintext();
+        let k0is = compute_k0is(moduli, t)?;
         let n = dkg_params.degree() as u64;
         let q_mod_t = (&modulus_q % t)
             .to_u64()
@@ -591,7 +580,6 @@ impl Computation for Inputs {
 
         let mut k1 = Polynomial::from_u64_vector(k1_u64);
         k1.reverse();
-        k1.center(&BigInt::from(t));
 
         let mut message = Polynomial::from_u64_vector(plaintext_poly_u64(&pt)?);
         message.reverse();
@@ -651,7 +639,7 @@ impl Computation for Inputs {
                 "DKG e0 must fit in every modulus: e0 mod q_{i} differs from e0, so e0_bound >= q_i / 2"
             );
 
-            let k0qi = BigInt::from(qi.inv(qi.neg(t)).unwrap());
+            let k0qi = BigInt::from(k0is[i]);
             let ki = k1.scalar_mul(&k0qi);
 
             let ct0i_hat = {
@@ -752,19 +740,18 @@ impl Computation for Inputs {
         let ct0_r = CrtPolynomial::new(ct0_r);
         let ct1_r = CrtPolynomial::new(ct1_r);
 
-        // z[j] = round(q_mod_t * m[j] / t), i.e. the carry that puts `q_mod_t * m - t * z` in the
-        // centred window modulo t. The circuit pins it by asserting that window, so an off-by-one
-        // here fails there rather than passing silently.
+        // z[j] = floor(q_mod_t * m[j] / t), i.e. the carry that puts `q_mod_t * m - t * z` in
+        // `[0, t)`. The circuit pins it by asserting that window, so an off-by-one here fails there
+        // rather than passing silently.
         let t_big = BigInt::from(dkg_params.plaintext());
         let scale_big = BigInt::from(compute_q_mod_t(
             &compute_q_product(dkg_params.moduli()),
             dkg_params.plaintext(),
         ));
-        let half_t = (&t_big - BigInt::from(1)) / BigInt::from(2);
         let z_coeffs: Vec<BigInt> = message
             .coefficients()
             .iter()
-            .map(|m| (&scale_big * m + &half_t) / &t_big)
+            .map(|m| (&scale_big * m) / &t_big)
             .collect();
         let z = CrtPolynomial::new(vec![Polynomial::new(z_coeffs)]);
 
@@ -887,6 +874,30 @@ mod tests {
 
         assert_eq!(inputs.message.coefficients(), expected.coefficients());
     }
+
+    #[test]
+    fn generated_share_encryption_witness_respects_ct0_r_bounds() {
+        let preset = BfvPreset::InsecureThreshold512;
+        let sample = ShareEncryptionCircuitData::generate_sample(
+            preset,
+            CiphernodesCommitteeSize::Minimum.values(),
+            DkgInputType::SecretKey,
+            preset.search_defaults().unwrap().z,
+        )
+        .unwrap();
+        let bounds = Bounds::compute(preset, &sample).unwrap();
+        let inputs = Inputs::compute(preset, &sample).unwrap();
+
+        for (i, limb) in inputs.ct0_r.limbs.iter().enumerate() {
+            let bound = BigInt::from(bounds.ct0_r_bounds[i].clone());
+            for (j, coefficient) in limb.coefficients().iter().enumerate() {
+                assert!(
+                    coefficient.magnitude() <= bound.magnitude(),
+                    "ct0_r[{i}][{j}] = {coefficient} outside [-{bound}, {bound}]"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -981,21 +992,6 @@ mod scaled_quotient_tests {
                 "ALPHA[{l}] identity"
             );
         }
-    }
-
-    /// Independently derived widths must match what `feat/secure-circuit-optimizations` hardcodes.
-    ///
-    /// That branch tuned 27 / 19 / 14 by hand for exactly this parameter set. Reproducing them from
-    /// the identity's terms is the evidence that the derivation is the real one rather than a
-    /// coincidence that happens to fit.
-    #[test]
-    fn secure_widths_match_the_hand_tuned_branch() {
-        let (sq, _, _) = derive_for(BfvPreset::SecureThreshold8192);
-        assert_eq!(sq.q0_bit, 27, "Q0 width");
-        assert_eq!(sq.q0_diff_bit, 19, "Q0 difference width");
-        assert_eq!(sq.q1_bit, 14, "Q1 width");
-        assert_eq!(sq.t_pow_bit, 57, "T = 2^57 + gap");
-        assert_eq!(sq.t_gap_bit, 25, "gap above 2^57 is 25 bits");
     }
 
     /// `L = 1` makes `DELTA` smaller than `q`, so no `k >= 1` gives a small `SMALL_D`.

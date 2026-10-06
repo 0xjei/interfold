@@ -122,11 +122,11 @@ export interface ActiveBfvConfig {
 const INSECURE_PARAM_SET_HASH =
   "0x18c6d8650486b997d48aa2d285fae878fb267b268332d056a3e8527d50e87b4f";
 const INSECURE_CONFIG_ID =
-  "0x20d76557cc2aee078754ad9a563d61d0697809da363f1979895ec15f6ea30db9";
+  "0x119c9bde7d7a31aaeef3e696ea29f8590c611d431921b6981434bd2c0fb5f7d1";
 const SECURE_PARAM_SET_HASH =
-  "0xd7068fdcc1910f5e49c8b05530cf74f876cadee2a1caf797a40b1ae53ae143ec";
+  "0x80775a19b6126a12943f9c1c53f92299f0c92ece819b625026ab1406bbbe0721";
 const SECURE_CONFIG_ID =
-  "0x3115e08eb5c87d6d245eda5dff0cf377c42e29b9741f94fc7a83efc3da7da920";
+  "0x5ebb3432396f21cd97fca47e006b9dd38c021bf2902d3e555cf74cb91b28e44e";
 
 function bfvConfig(
   preset: BfvArtifactPreset,
@@ -137,7 +137,7 @@ function bfvConfig(
   return {
     preset,
     committee,
-    paramSet: secure ? 1 : 0,
+    paramSet: secure ? 2 : 0,
     paramSetHash: secure ? SECURE_PARAM_SET_HASH : INSECURE_PARAM_SET_HASH,
     configId: secure ? SECURE_CONFIG_ID : INSECURE_CONFIG_ID,
     ...params,

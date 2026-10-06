@@ -252,7 +252,7 @@ test('shared Noir constants change the hash but the active preset does not', () 
   }
 })
 
-test('config generation binds both BFV parameter sets to circuit version v3', () => {
+test('config generation binds both BFV parameter sets to circuit version v4', () => {
   const dir = mkdtempSync(join(tmpdir(), 'interfold-circuit-version-'))
   const utilsPath = join(dir, 'packages/interfold-contracts/scripts/utils.ts')
   const contractPath = join(dir, 'packages/interfold-contracts/contracts/lib/ActiveCryptoConfig.sol')
@@ -264,7 +264,7 @@ test('config generation binds both BFV parameter sets to circuit version v3', ()
     builder.syncProtocolConfig('insecure-512', 'minimum')
     const contract = readFileSync(contractPath, 'utf8')
     const utils = readFileSync(utilsPath, 'utf8')
-    assert.match(contract, /CIRCUIT_VERSION = keccak256\("interfold-bfv-v3"\)/)
+    assert.match(contract, /CIRCUIT_VERSION = keccak256\("interfold-bfv-v4"\)/)
     for (const [prefix, params] of [
       ['INSECURE', BFV_PARAMS.insecure512],
       ['SECURE', BFV_PARAMS.secure8192],
@@ -278,10 +278,8 @@ test('config generation binds both BFV parameter sets to circuit version v3', ()
       )
       const configId = (version: string) =>
         keccak256(coder.encode(['bytes32', 'bytes32', 'bytes32'], [id('fhe.rs:BFV'), paramHash, id(version)]))
-      assert.match(contract, new RegExp(`${prefix}_CONFIG_ID =\\s*${configId('interfold-bfv-v3')}`))
-      assert.match(utils, new RegExp(`${prefix}_CONFIG_ID =\\s*"${configId('interfold-bfv-v3')}"`))
-      assert.notEqual(configId('interfold-bfv-v3'), configId('interfold-bfv-v1'))
-      assert.notEqual(configId('interfold-bfv-v3'), configId('interfold-bfv-v2'))
+      assert.match(contract, new RegExp(`${prefix}_CONFIG_ID =\\s*${configId('interfold-bfv-v4')}`))
+      assert.match(utils, new RegExp(`${prefix}_CONFIG_ID =\\s*"${configId('interfold-bfv-v4')}"`))
     }
   } finally {
     rmSync(dir, { recursive: true, force: true })

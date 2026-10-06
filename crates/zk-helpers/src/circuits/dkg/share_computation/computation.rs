@@ -175,7 +175,7 @@ impl Computation for Bounds {
             data.n_parties as usize,
             num_ciphertexts as usize,
             lambda,
-        );
+        )?;
 
         let e_sm_calculator = SmudgingBoundCalculator::new(e_sm_config);
 

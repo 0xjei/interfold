@@ -330,7 +330,7 @@ carry gives a second opening and the IF-013 attack returns through `ct0` instead
 `ciphertext_second_opening_is_rejected` pins that. Proposed in #2144.
 
 **C3's message scaling, the largest win on the branch.** `k1` is the message scaled by
-`SCALE = Q mod t` and centred modulo `t`. Writing that reduction as a carry,
+`SCALE = Q mod t` and reduced into `[0, t)`. Writing that reduction as a carry,
 `k1 = SCALE * m - t * z`, makes it affine, so with `k0 * t = BETA * q - 1` and
 `k0 * SCALE = ALPHA * q - SMALL_D` the whole `k0 * k1` term folds into the quotient:
 `ct0 = pk0 * u + e0 - SMALL_D * m + z + q * Q0` with `Q0 = r + ALPHA * m - BETA * z`. Measured
@@ -339,19 +339,20 @@ carry gives a second opening and the IF-013 attack returns through `ct0` instead
 roughly -1.27B gates per DKG, far more than every other circuit on this branch combined.
 
 **Most of it is transcript, not arithmetic.** The direct path pushes all `N` coefficients of `k1`
-into the sponge _unpacked_, one absorption each; the scaled form never builds `k1`. `ct0_r` at 55
-bits is also replaced by `Q0` at 27. The arithmetic saving -- dropping a modular multiply and a
-centring comparison per coefficient -- is the smaller half.
+into the sponge _unpacked_, one absorption each; the scaled form never builds `k1`. `ct0_r` at 58
+bits is also replaced by `Q0` at 26. The arithmetic saving -- dropping the modular multiply per
+coefficient -- is the smaller half.
 
 **Why the quotient is narrow, and why it generalises.** `Q0` is dominated by `SMALL_D * m / q`, and
 `SMALL_D = k * q - floor(prod(q) / t)` is small because every modulus sits just above a power of
 two: `floor(prod(q)/t) / q` is then close to `2^(bits(q) - bits(t))`, so `k` is that power of two.
-Derived widths reproduce what `feat/secure-circuit-optimizations` hardcodes -- 27 / 19 / 14 -- and
-#1996 comes out a bit tighter at 26 / 18 / 13. insecure-512 has one DKG modulus, so
-`floor(q/t) < q`, no `k` works, and `SHARED_QUOTIENT` is generated false; that preset keeps the
-direct path, which is fine for a test-only parameter set. Gating on the generated flag rather than
-on `N == 8192 && L == 2` means a new parameter set is either included or excluded loudly, never
-handed wrong constants.
+Derived widths reproduce what `feat/secure-circuit-optimizations` hardcodes for the earlier secure
+parameters -- 27 / 19 / 14. The current secure parameters from #1996 derive 26 / 18 / 14.
+insecure-512 has one DKG modulus, so `floor(q/t) < q`, no `k` works, and
+`SHARE_ENCRYPTION_SCALED_QUOTIENT` is generated false; that preset keeps the direct path, which is
+fine for a test-only parameter set. Gating on the generated flag rather than on
+`N == 8192 && L == 2` means a new parameter set is either included or excluded loudly, never handed
+wrong constants.
 
 **`z` is a witness, not a hint.** Computing the carry in-circuit with `__compute_mod_reduction` made
 `nargo execute` emit `bug: Brillig function call isn't properly covered by a manual constraint`, the
@@ -551,7 +552,7 @@ Findings in the ballot path of the reference app (`examples/CRISP`), not the pro
 | Z-08 | **Controller-scoped E3 identity**                               | Resolved | Every fresh Interfold controller starts its E3 sequence with the controller address in the high 160 bits. All contracts retain the complete `uint256`; Rust and the indexer store it as a decimal string, so a replacement controller cannot collide with another controller on the same chain.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | Z-11 | **Reusable operator-tree capacity**                             | Resolved | Removing an operator adds its zeroed tree index to a free list. A later registration reuses that index before growing the tree. Request-time roots remain immutable, and the registry emits a warning if lifetime tree size reaches 80 percent of capacity.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | Z-16 | **Safe slashing-manager retirement**                            | Resolved | Retiring managers remain authorized for their assigned E3s, bans, slash locks, proposals, and pending routes. `closeE3` now also waits for the objective accusation submission deadline. Revocation requires every canonical obligation counter to be zero.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| Z-24 | **Build-bound crypto configuration**                            | Resolved | The generated configuration ID binds the encryption scheme, exact parameter hash, and circuit version. Requests accept only that append-only configuration and snapshot its verifier addresses. Rust validates the emitted ID against its local build, and the indexer uses local immutable parameters plus the E3's frozen ID instead of querying mutable live parameter bytes.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| Z-24 | **Build-bound crypto configuration**                            | Resolved | The generated configuration ID binds the encryption scheme, exact parameter hash, and circuit version. Requests accept only that append-only configuration and snapshot its verifier addresses. Rust validates the emitted ID against its local build. The indexer uses local immutable parameters for current requests; for historical index-0 and index-1 public-key events, it reads the append-only registry bytes and checks their v1 configuration ID against the E3's frozen ID.                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | Z-45 | **In-call request fee bound**                                   | Resolved | Each request supplies its expected fee token, expected crypto configuration, and maximum fee. Any change between quote and inclusion reverts before escrow transfer. The SDK obtains a fresh quote when the caller does not provide an explicit maximum.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 
 ### Scope of the Zenith `Z-` entries

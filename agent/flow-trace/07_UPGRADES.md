@@ -17,8 +17,28 @@ within the same protocol version.
 The v0.19 DKG message layout requires storage schema 8, threshold-keyshare recovery schema 8, gossip
 wire major 5, and sync wire major 4. Both `ThresholdShareCreated` and `DecryptionKeyShared` include
 a dealer signature. Their event-log records, recovery inputs, and DHT payloads are incompatible with
-the unsigned layout. Protocol version 6 and node generation 2 remain the release cutover values.
+the unsigned layout. Protocol version 7 and node generation 2 remain the release cutover values.
 This change requires drain-and-resync; it has no layout migration.
+
+The fhe.rs v0.4.1 upgrade sets `protocol_version` to 7. Its smudging bound and BFV validation rules
+change the DKG and proof inputs. Its non-centered plaintext scale also changes the CRISP ballot check
+and its circuit artifacts. Drain active E3s and install matching circuit artifacts and verifier
+routes before requests resume. Both parameter sets use the circuit ID domain `interfold-bfv-v4`. Old
+clients must update their expected configuration IDs before they submit new requests. The RISC Zero
+guest in `crates/support` uses a separate, content-addressed Interfold revision. Rebuild its image
+and provenance record before changing that guest revision or its fhe.rs pin.
+
+The mainnet `paramSetRegistry(1)` contains the previous secure parameters and cannot be changed.
+Version 7 uses parameter-set index 2 for the new secure tuple. Keep index 1 intact for old E3
+records. While requests are paused and all E3s have drained, register index 2 in the same governance
+batch that installs the version-7 implementation and verifier routes. Validate the registered bytes
+against the new secure tuple before requests resume. Version-7 ciphernodes and request clients
+reject index 1. The indexer reads current index-0 and index-2 public keys with local v4 parameters.
+For historical index-0 and index-1 public-key events, it reads the append-only registry bytes and
+checks their v1 configuration ID against the request before it validates the key.
+
+The non-centered plaintext scale also changes the C3 share-encryption and user-data-encryption `k1`
+witnesses and their quotient bounds. Rebuild those proofs with the matching circuits.
 
 ## Compatible rolling release
 
@@ -108,12 +128,13 @@ On a testnet, a fresh protocol, CRISP, and DAO stack is an acceptable alternativ
 upgrade. It must still pass the same route and verification-key validation before it accepts an E3.
 The old and new stacks must use separate addresses so clients cannot silently combine them.
 
-The BFV circuits use `interfold-bfv-v3` with compiled `protocol_version = 6` and
+The BFV circuits use `interfold-bfv-v4` with compiled `protocol_version = 7` and
 `node_generation = 2`. The configuration ID binds this circuit version even when BFV parameters stay
-unchanged. The builder generates both precomputed IDs. Runtime readers, the indexer, CRISP intake,
-request tooling, and the SDK use the same IDs and reject v1 and v2 requests. The indexer skips
-historical keys for unsupported configuration IDs without storing them. This lets its catch-up
-cursor advance across drained unsupported rounds to recover supported rounds. Recursive folds carry
+unchanged. The builder generates both precomputed IDs. Runtime readers, CRISP intake, request
+tooling, and the SDK use the same IDs and reject v1, v2, and v3 requests. The indexer also accepts
+v1 keys of historical index-0 and index-1 E3s, as the version model describes. It skips keys for
+other unsupported configuration IDs without storing them. This lets its catch-up cursor advance
+across drained unsupported rounds to recover supported rounds. Recursive folds carry
 fixed leaf, fold, and genesis VK hashes. Final aggregator public input zero binds the complete
 recursive VK tree. These proof formats require a governance cutover, not a mixed rolling release.
 Rebuild all six artifact pairs and replace the immutable BFV verifier wrappers and routers before
@@ -136,7 +157,7 @@ snapshot the operator counts and registry root
   -> preserve the registered operators and revoke the drained old manager
   -> deploy a replacement VRF consumer against the existing funded subscription
   -> add the new consumer and switch the registry without replacing the subscription
-  -> register the secure BFV parameter set and all committee thresholds
+  -> register the version-7 secure BFV parameter set at index 2 and all committee thresholds
   -> install the secure minimum, micro, and small verifier routes
   -> install the PK, decryption, and ciphertext verifiers
   -> register and bind the CRISP program
