@@ -3,7 +3,9 @@
 //! Actix routing for local replay, remote sync requests, and readiness signals.
 
 use super::*;
-use e3_events::{E3Stage, HistoricalNetSyncFailed};
+use crate::domain::net_event_batch::LatestTs;
+use e3_events::E3Stage;
+use std::sync::Arc;
 
 impl Actor for NetSyncManager {
     type Context = actix::Context<Self>;
@@ -82,7 +84,18 @@ impl Handler<TypedEvent<HistoricalNetSyncStart>> for NetSyncManager {
         let bus = self.bus.with_ec(msg.get_ctx());
         let event_context = msg.get_ctx().clone();
         let failure = msg.failure.clone();
+        self.history_failure = failure.clone();
         let address = ctx.address();
+        // Peers' events must stay within the clock-drift allowance, which the node applies again
+        // when it publishes the history. The allowance grows with the clock, so each source is
+        // checked against it when its history is complete. A clock that cannot tell it fails the
+        // fetch before any peer is asked.
+        if let Err(error) = self.bus.latest_admissible_ts() {
+            report_required_history_failure(&bus, failure, error);
+            return Box::pin(async {});
+        }
+        let clock = self.bus.clone();
+        let latest_ts: LatestTs = Arc::new(move || clock.latest_admissible_ts());
         let fetch = handle_sync_request_event(
             self.tx.clone(),
             self.rx.clone(),
@@ -90,6 +103,10 @@ impl Handler<TypedEvent<HistoricalNetSyncStart>> for NetSyncManager {
             address.clone(),
             !self.readiness_all_peers_dialed(),
             self.network.clone(),
+            HistoryBounds {
+                latest_ts,
+                eventstore: self.eventstore.clone(),
+            },
         );
         if !self.peer_history_optional {
             return Box::pin(async move {
@@ -152,22 +169,27 @@ impl Handler<TypedEvent<SyncRequestSucceeded>> for NetSyncManager {
         msg: TypedEvent<SyncRequestSucceeded>,
         _: &mut Self::Context,
     ) -> Self::Result {
-        trap(EType::Net, &self.bus.with_ec(msg.get_ctx()), || {
-            info!("SYNC REQUEST SUCCEEDED");
-            let (msg, ctx) = msg.into_components();
-            let response = msg.response;
-            self.bus.publish_from_remote_as_response(
-                HistoricalNetSyncEventsReceived {
-                    events: response.events.to_vec(),
-                },
-                response.ts,
-                ctx,
-                None,
-                EventSource::Net,
-            )?;
-
-            Ok(())
-        });
+        info!("SYNC REQUEST SUCCEEDED");
+        let bus = self.bus.with_ec(msg.get_ctx());
+        let (msg, ctx) = msg.into_components();
+        let response = msg.response;
+        if let Err(error) = self.bus.publish_from_remote_as_response(
+            HistoricalNetSyncEventsReceived {
+                events: response.events.to_vec(),
+            },
+            response.ts,
+            ctx,
+            None,
+            EventSource::Net,
+        ) {
+            // Startup waits for this history; without it, it would wait until its deadline.
+            let error = error.context("failed to publish the fetched peer history");
+            if self.peer_history_optional {
+                bus.err(EType::Net, error);
+            } else {
+                report_required_history_failure(&bus, self.history_failure.take(), error);
+            }
+        }
     }
 }
 
@@ -218,8 +240,14 @@ impl Handler<IncomingRequest> for NetSyncManager {
             );
             let query: HashMap<AggregateId, u128> =
                 HashMap::from([(fetch_request.aggregate_id(), fetch_request.since())]);
-            self.requests
-                .insert(id, PendingSyncRequest { peer, responder });
+            self.requests.insert(
+                id,
+                PendingSyncRequest {
+                    peer,
+                    responder,
+                    observed_from: self.live_history.since(),
+                },
+            );
             let storage_query =
                 EventStoreQueryBy::<TsAgg>::new(id, query, ctx.address().recipient())
                     .with_limit(scan_limit as u64)
@@ -295,7 +323,12 @@ impl Handler<EventStoreQueryResponse> for NetSyncManager {
                 ))?;
                 bail!("event store answered a historical-sync page without scan progress");
             };
-            match build_sync_batch(events, history, &fetch_request) {
+            // The live-history time from the admission counts only if it still holds: a reply
+            // must not say that the node observed a range live after the node lost gossip.
+            let observed_from = pending
+                .observed_from
+                .filter(|_| self.live_history.since() == pending.observed_from);
+            match build_sync_batch(events, history, observed_from, &fetch_request) {
                 SyncBatchOutcome::BadRequest(reason) => pending.responder.bad_request(reason)?,
                 SyncBatchOutcome::Failed(reason) => {
                     warn!(%reason, "Cannot serve a historical-sync request");

@@ -72,7 +72,11 @@ async fn failed_peer_history_fetch_stops_startup_at_once() -> anyhow::Result<()>
 
     let error = tokio::time::timeout(
         std::time::Duration::from_secs(1),
-        fetch_peer_history(&bus, BTreeMap::from([(AggregateId::new(1), 0)])),
+        fetch_peer_history(
+            &bus,
+            BTreeMap::from([(AggregateId::new(1), 0)]),
+            Default::default(),
+        ),
     )
     .await?
     .unwrap_err();

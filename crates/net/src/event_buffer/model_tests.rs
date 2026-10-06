@@ -48,6 +48,7 @@ async fn test_non_advancing_cursor_is_rejected() {
         events: vec![b"event1".to_vec()],
         next: BatchCursor::Next(0),
         aggregate_id: AggregateId::new(1),
+        observed_from: None,
     };
     let handle = DirectRequesterTester::new(net_cmds_rx, net_events_tx)
         .expect_request(FetchEventsSince::new(AggregateId::new(1), 0, 1))
@@ -61,6 +62,7 @@ async fn test_non_advancing_cursor_is_rejected() {
         0,
         1,
         &mut SyncFetchBudget::production(),
+        None,
     )
     .await
     .unwrap_err();
@@ -82,16 +84,19 @@ async fn test_three_batches_with_cursor_continuity() {
         events: vec![b"a".to_vec(), b"b".to_vec()],
         next: BatchCursor::Next(200),
         aggregate_id: AggregateId::new(1),
+        observed_from: None,
     };
     let batch2 = EventBatch {
         events: vec![b"c".to_vec(), b"d".to_vec()],
         next: BatchCursor::Next(400),
         aggregate_id: AggregateId::new(1),
+        observed_from: None,
     };
     let batch3 = EventBatch {
         events: vec![b"e".to_vec()],
         next: BatchCursor::Done,
         aggregate_id: AggregateId::new(1),
+        observed_from: None,
     };
 
     let handle = DirectRequesterTester::new(net_cmds_rx, net_events_tx)
@@ -110,9 +115,11 @@ async fn test_three_batches_with_cursor_continuity() {
         0,
         2,
         &mut SyncFetchBudget::production(),
+        None,
     )
     .await
-    .unwrap();
+    .unwrap()
+    .events;
 
     handle.await.unwrap();
 
@@ -125,4 +132,51 @@ async fn test_three_batches_with_cursor_continuity() {
     ];
     assert_eq!(events.len(), expected.len());
     assert_eq!(events, expected);
+}
+
+#[tokio::test]
+async fn a_responder_that_resets_between_pages_fails_as_a_source() {
+    let (net_cmds_tx, net_cmds_rx) = mpsc::channel::<NetCommand>(16);
+    let net_events_tx = NetEventChannel::new(16);
+    let _net_events_rx = net_events_tx.subscribe();
+    let net_events = NetEventSubscriber::from(&net_events_tx);
+
+    let requester = DirectRequester::builder(net_cmds_tx, net_events).build();
+    // The first page vouches from 5. The responder then resets and answers the next cursor
+    // from an empty log while it starts up.
+    let first = EventBatch {
+        events: vec![b"a".to_vec()],
+        next: BatchCursor::Next(200),
+        aggregate_id: AggregateId::new(1),
+        observed_from: Some(5),
+    };
+    let after_reset = EventBatch::<Vec<u8>> {
+        events: vec![],
+        next: BatchCursor::Done,
+        aggregate_id: AggregateId::new(1),
+        observed_from: None,
+    };
+    let handle = DirectRequesterTester::new(net_cmds_rx, net_events_tx)
+        .expect_request(FetchEventsSince::new(AggregateId::new(1), 0, 1))
+        .respond_with(first)
+        .expect_request(FetchEventsSince::new(AggregateId::new(1), 200, 1))
+        .respond_with(after_reset)
+        .spawn();
+
+    let error = fetch_all_batched_events_with_budget::<Vec<u8>>(
+        requester,
+        PeerTarget::Random,
+        AggregateId::new(1),
+        0,
+        1,
+        &mut SyncFetchBudget::production(),
+        None,
+    )
+    .await
+    .unwrap_err();
+
+    handle.await.unwrap();
+    assert!(error
+        .to_string()
+        .contains("changed its live-history time from Some(5) to None"));
 }

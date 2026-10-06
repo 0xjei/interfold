@@ -610,6 +610,51 @@ within the 10 MiB response limit less the frame header. Its events can use all o
 except the encoded size of a reply without events; a single event above that budget fails the
 request.
 
+A starting node fetches each aggregate's history from two admitted peers, because one peer can lack
+part of the range after a restart or a reset and still answer `Done`. Each peer starts from the
+requested timestamp, every page of its history goes to that peer, and the node keeps the union, one
+copy per event ID, with the earliest timestamp. Each event's ID must be the hash of its payload, so
+a peer cannot hide another peer's copy of a different event under the same ID; the ID does not fix
+the whole payload, so two copies with one ID and different payloads fail the fetch. The event store
+holds one event at a timestamp and stops the node at a second one, so the node first reads the
+claims of the records in its store after the cursor on their timestamps (each record's ID and the
+SHA-256 digest of its payload's encoding, within the fetch deadline and at most 100,000 of them).
+The read includes the legacy records of another aggregate that queries otherwise quarantine: they
+hold their timestamps in the store too. It adds the claims of the historical EVM events that
+startup publishes with the peer history. It refuses a peer that serves an event from before the
+requested time, two events at one timestamp, or an event at a claimed timestamp whose ID or payload
+digest differs from the claim's; two sources that put different events at one timestamp fail the
+fetch. A failed peer is replaced by another one. When the listed
+peers do not supply two sources, the aggregate's fetch fails and a recovery round asks again; one
+connected peer serves alone. A peer that a later peer can replace gets one attempt per page and the
+time left less 60 s for each source that the node would then still lack (at least 30 s), so slow or
+silent peers cannot use up the five-minute fetch deadline before the node reaches a healthy one; a
+peer that no later peer can replace gets three attempts and all the time left. Listing the admitted
+peers and the waits between recovery rounds count against the deadline too.
+
+Each reply carries `observed_from`, a hint of the time from which the responder stores history live.
+The responder sets it once the gossip that it held during its own startup is durable: its startup
+buffer releases that gossip at `SyncEnded` and then a marker, and the translator begins live history
+after the marker, when the event pipeline has stored what it handed over. Input lag after startup,
+at the buffer or the translator, skips gossip that never reaches storage, and revokes the hint for
+the rest of the process. A reply carries the value from when the node admitted the request, before
+its storage read, and none when the value changed by the reply. A requester fails a source whose
+value changes between pages, as after a reset. While no source's hint covers the whole range, the
+node asks further peers, up to four in all, and then logs that the history may be incomplete. It
+asks them only after every aggregate has its sources, with what the fetch budget has left, so these
+optional reads cannot leave a required one without budget. Such a peer gets one attempt per page and
+at most 30 s and half the time left. When it fails, serves a different payload under an event ID
+that the sources served, or puts a different event at the timestamp of a source's event, it adds
+nothing and the sources stand. The node publishes the history at its latest event time, so it
+refuses a peer's history with an event stamped beyond its clock-drift allowance. It checks each
+source against the allowance when that source's history is complete, because a peer ahead of the
+node within the allowance stores events while the node pages; the allowance has only grown when the
+node applies it again at publication. A history that it still cannot publish fails startup through
+the startup coordinator. The hint does not make a reply
+complete: gossip that the responder received but has not stored yet, in its translator or event
+pipeline, is missing from a read. So the node relies on the union of two sources, and a wrong hint
+only means that it asks no more peers than two.
+
 The document publisher fetches documents in spawned tasks, so a slow DHT read does not hold its
 ingress loop. At most 8 fetches run and 512 documents wait. Four concurrent N=19 E3s need
 `4 * 3 * 18 = 216` remote documents per node. A 2x margin gives 432, rounded up to 512 queue slots.
@@ -1177,9 +1222,11 @@ operation. A destructive reset removes the local event log—the node's source o
 reconstruct only observations still available from configured EVM ranges and peers. One historical
 network startup attempt, including all aggregates and retries, is capped at 512 pages, 50,000
 events, 128 MiB, and five minutes, with no operator override in the current implementation.
-Exceeding a budget or discovering unavailable history is therefore a startup blocker, not a signal
-to silently skip data. Unsupported schema state likewise requires a compatible binary, a verified
-backup, or an explicit reset; no automatic migration is implemented.
+Exceeding a budget while the node collects the required sources, or discovering unavailable history,
+is therefore a startup blocker, not a signal to silently skip data. Once every aggregate has its
+sources, the node asks further peers only for the live-history hint; when the budget runs out there,
+it stops asking and starts with the sources. Unsupported schema state likewise requires a compatible
+binary, a verified backup, or an explicit reset; no automatic migration is implemented.
 
 The multi-process SWARM supervisor has a separate child-process lifecycle:
 

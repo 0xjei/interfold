@@ -8,7 +8,7 @@ use crate::events::{
     call_and_await_response, GossipData, GossipPublishFailure, NetCommand, NetEvent,
 };
 use crate::net_interface_handle::NetEventSubscriber;
-use crate::NetworkPolicy;
+use crate::{LiveHistory, NetworkPolicy};
 use actix::prelude::*;
 use anyhow::Result;
 use e3_events::{
@@ -33,6 +33,8 @@ pub struct NetEventTranslator {
     events: NetEventSubscriber,
     service: EventTranslationService,
     pending: HashMap<CorrelationId, PendingPublish>,
+    /// Begins once the gossip that the startup buffer held is durable.
+    live_history: LiveHistory,
 }
 
 const MAX_GOSSIP_PUBLISH_ATTEMPTS: u8 = 3;
@@ -59,6 +61,11 @@ impl Actor for NetEventTranslator {
 #[rtype(result = "()")]
 struct LibP2pEvent(pub GossipData, pub Option<libp2p::PeerId>);
 
+/// The startup buffer has released every event that it held.
+#[derive(Message, Clone, Copy, Debug)]
+#[rtype(result = "()")]
+struct StartupBufferReleased;
+
 impl NetEventTranslator {
     /// Create a new NetEventTranslator actor
     pub fn new(
@@ -74,17 +81,23 @@ impl NetEventTranslator {
             events: events.clone(),
             service: EventTranslationService::with_network(topic, network),
             pending: HashMap::new(),
+            live_history: LiveHistory::default(),
         }
     }
 
+    /// Set up the translator. `live_history` begins once the gossip that the startup buffer held
+    /// is durable.
     pub fn setup(
         bus: &BusHandle,
         tx: &mpsc::Sender<NetCommand>,
         rx: &NetEventSubscriber,
         topic: &str,
         network: NetworkPolicy,
+        live_history: LiveHistory,
     ) -> Addr<Self> {
-        let addr = NetEventTranslator::new(bus, tx, rx, topic, network).start();
+        let mut translator = NetEventTranslator::new(bus, tx, rx, topic, network);
+        translator.live_history = live_history.clone();
+        let addr = translator.start();
         let mut rx = rx.subscribe();
 
         // Listen on all events
@@ -92,19 +105,37 @@ impl NetEventTranslator {
         info!("NetEventTranslator is running");
         tokio::spawn({
             let addr = addr.clone();
+            let live_history = live_history.clone();
             async move {
-                while let Some(event) =
-                    crate::event_subscription::recv_net_event(&mut rx, "NetEventTranslator").await
-                {
-                    let (data, peer) = match event {
+                loop {
+                    let event = match rx.recv().await {
+                        Ok(event) => event,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped_events)) => {
+                            // Skipped gossip never reaches storage, so history replies stop saying
+                            // that this node observed the network live.
+                            warn!(
+                                skipped_events,
+                                "NetEventTranslator lagged; resuming from retained events"
+                            );
+                            live_history.revoke();
+                            continue;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    };
+                    // Each send waits for the actor, so the actor handles the marker after
+                    // every gossip event that the buffer released before it.
+                    let delivery = match event {
                         NetEvent::GossipIngress {
                             propagation_source,
                             data: data @ GossipData::GossipBytes(_),
-                        } => (data, Some(propagation_source)),
-                        NetEvent::GossipData(data @ GossipData::GossipBytes(_)) => (data, None),
+                        } => addr.send(LibP2pEvent(data, Some(propagation_source))).await,
+                        NetEvent::GossipData(data @ GossipData::GossipBytes(_)) => {
+                            addr.send(LibP2pEvent(data, None)).await
+                        }
+                        NetEvent::StartupBufferReleased => addr.send(StartupBufferReleased).await,
                         _ => continue,
                     };
-                    if let Err(error) = addr.send(LibP2pEvent(data, peer)).await {
+                    if let Err(error) = delivery {
                         warn!(%error, "NetEventTranslator stopped; ending gossip ingress");
                         break;
                     }
@@ -245,6 +276,33 @@ impl Handler<LibP2pEvent> for NetEventTranslator {
     }
 }
 
+/// Every gossip event that the startup buffer held has gone to the sequencer. Once the event
+/// pipeline has stored them, the node stores history live and its history replies vouch for it.
+impl Handler<StartupBufferReleased> for NetEventTranslator {
+    type Result = ();
+    fn handle(&mut self, _: StartupBufferReleased, ctx: &mut Self::Context) -> Self::Result {
+        let bus = self.bus.clone();
+        let live_history = self.live_history.clone();
+        ctx.spawn(
+            async move {
+                bus.flush_event_pipeline().await?;
+                bus.ts()
+            }
+            .into_actor(self)
+            .map(move |result, actor, _| match result {
+                Ok(ts) => live_history.begin(ts),
+                Err(error) => {
+                    // Without the time, history replies do not vouch for any range.
+                    actor.bus.err(
+                        EType::Net,
+                        error.context("could not store the gossip held during startup"),
+                    );
+                }
+            }),
+        );
+    }
+}
+
 /// Reads the network's result of a gossip publication.
 fn publish_result(event: &NetEvent) -> Option<Result<Result<(), GossipPublishFailure>>> {
     match event {
@@ -294,6 +352,37 @@ mod tests {
     use e3_utils::ArcBytes;
     use libp2p::gossipsub::MessageId;
 
+    /// Gossip that the translator skips on lag never reaches storage, so the node no longer says
+    /// that it observed the network live.
+    #[actix::test]
+    async fn translator_lag_revokes_live_history() -> anyhow::Result<()> {
+        let system = EventSystem::new().with_fresh_bus();
+        let bus = system.handle()?.enable("translator-lag");
+        let (tx, _commands) = mpsc::channel(8);
+        let events = NetEventChannel::new(2);
+        let live_history = LiveHistory::default();
+        live_history.begin(5);
+        let _translator = NetEventTranslator::setup(
+            &bus,
+            &tx,
+            &NetEventSubscriber::from(&events),
+            "topic",
+            NetworkPolicy::local_unrestricted(),
+            live_history.clone(),
+        );
+
+        for byte in 0..10u8 {
+            let _ = events.send(NetEvent::GossipData(GossipData::GossipBytes(vec![byte])));
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while live_history.since().is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        Ok(())
+    }
+
     fn local_forwardable_event() -> InterfoldEvent {
         let event: InterfoldEvent<Unsequenced> = InterfoldEvent::new_with_timestamp(
             KeyshareCreated {
@@ -331,6 +420,7 @@ mod tests {
             &NetEventSubscriber::from(&events),
             "topic",
             NetworkPolicy::local_unrestricted(),
+            LiveHistory::default(),
         );
         let peers = [
             libp2p::PeerId::random(),
@@ -459,6 +549,7 @@ mod tests {
             &NetEventSubscriber::from(&events),
             "topic",
             NetworkPolicy::local_unrestricted(),
+            LiveHistory::default(),
         );
         translator.send(local_forwardable_event()).await?;
         let Some(NetCommand::GossipPublish { correlation_id, .. }) = commands.recv().await else {
